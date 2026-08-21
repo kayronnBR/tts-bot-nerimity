@@ -1,104 +1,174 @@
-# 🤖 Bot TTS Nerimity
+# 🤖 Nerimity TTS Voice Bot
 
-Um bot para o **Nerimity** que converte mensagens de texto enviadas em caixa alta em áudio (*Text-to-Speech*), utilizando a voz neural em português da Microsoft, e reproduz o som no seu sistema.
+Bot para o [Nerimity](https://nerimity.com) que **entra automaticamente em um canal de voz** e **fala em voz alta** (usando TTS da Microsoft/Edge) qualquer mensagem escrita **EM CAPS LOCK** em um canal de texto.
 
----
-
-## ⚠️ Requisitos e Regras de Funcionamento
-
-* **Uso em Call:** Para que os membros do servidor ou da chamada ouçam o áudio do bot, você **deve obrigatoriamente estar conectado a um canal de voz no Nerimity** e redirecionar a saída de áudio do sistema para a sua transmissão ou microfone virtual.
-* **Mensagens em CAPSLOCK:** O bot lê **apenas** mensagens enviadas inteiramente em caixa alta (**CAPSLOCK**). Mensagens enviadas em letras minúsculas ou misturadas serão ignoradas.
+O áudio é transmitido **de verdade para dentro da chamada de voz** via WebRTC (não é só tocar um som no computador que roda o bot) — outras pessoas na call ouvem o bot falando.
 
 ---
 
-## 🛠️ Instalação e Pré-requisitos
+## ⚠️ Aviso importante
 
-### 1. Dependências do Sistema (Linux Mint)
-Instale o **qpwgraph** (gerenciador gráfico de áudio do PipeWire) via loja de aplicativos ou Flatpak:
+A Nerimity não possui uma API oficial e documentada para "bot entra na call e manda áudio". As chamadas de voz funcionam com **WebRTC em malha (mesh)**, sinalizado por Socket.IO. Este bot foi construído fazendo engenharia reversa do `nerimity_sdk` e do [cliente web oficial da Nerimity](https://github.com/Nerimity/nerimity-web) para replicar esse comportamento.
 
-* **Download:** [Flathub - qpwgraph](https://flathub.org/en/apps/org.rncbc.qpwgraph)
+Ou seja: funciona hoje, mas **não é um recurso oficialmente suportado**. Se a Nerimity mudar o protocolo de sinalização no futuro, pode ser necessário ajustar o código.
 
-### 2. Configuração do Ambiente Virtual Python
-Crie o ambiente virtual no seu repositório local e instale as bibliotecas necessárias:
+---
+
+## ✨ Funcionalidades
+
+- Conecta ao Nerimity usando o [`nerimity_sdk`](https://pypi.org/project/nerimity_sdk/) oficial.
+- Entra automaticamente em um canal de voz configurado.
+- Escuta um canal de texto e detecta mensagens 100% em **CAIXA ALTA**.
+- Gera a fala com [`edge-tts`](https://github.com/rany2/edge-tts) (voz neural da Microsoft, gratuita).
+- Transmite o áudio ao vivo para todos os participantes conectados na chamada via WebRTC (`aiortc`).
+
+---
+
+## 📋 Pré-requisitos
+
+- Python **3.9 ou superior**
+- Uma conta/token de bot no Nerimity ([como criar um bot](https://docs.nerimity.com))
+- Acesso à internet (para os servidores STUN/TURN e para gerar o TTS)
+- (Opcional, mas recomendado) `ffmpeg` instalado no sistema
+
+---
+
+## 🚀 Instalação — passo a passo
+
+### 1. Clone o repositório
 
 ```bash
-# Cria o ambiente virtual
-python3 -m venv ~/venv 
-
-# Ativa o ambiente e instala as dependências
-~/venv/bin/pip install pygame edge-tts nerimity-sdk
-
+git clone https://github.com/SEU_USUARIO/SEU_REPOSITORIO.git
+cd SEU_REPOSITORIO
 ```
 
----
-
-## 📁 Estrutura de Arquivos
-
-Certifique-se de salvar o código do bot no caminho especificado abaixo (ou no diretório de sua preferência):
-
-```plaintext
-/home/user/bot.py
-
-```
-
----
-
-## configurando token e canal onde o bot vai ler
-
-abre o arquivo bot.py e procure:
-TOKEN = "XXXXX"
-CANAL_ID = "XXXXX"
-
-onde tem os XXX altere para os codigo que vai pedir.
-
-sobre o token você precisa criar um bot no nerimity para monitorar o chat para gerar o audio
-1- https://nerimity.com/app/settings/developer/applications
-2- click em "adicionar aplicativo"
-3- defina o nome dele e volta para tela dos aplicativos
-4- selecione o bot que você criou
-5- click em "usuario do bot"
-6- copie o token e cole no arquivo do bot.py
-
-exemplo do resultado como vai ficar:
-TOKEN = "5M3vVeGvBDQbrFAMUJem"
-
-e para pegar o id do canal é facil
-1- entre no seu servidor
-2- click direito no canal
-3- "copiar id"
-
-agora volte no bot,py e altere, exemplo do resultado final
-CANAL_ID = "5M3vVeGvBDQbrFAMUJem"
-
-## 🎧 Configuração de Áudio (PipeWire + qpwgraph)
-
-Para redirecionar o som do bot para o Nerimity:
-
-1. Inicie a execução do bot no terminal.
-2. Abra o aplicativo **qpwgraph**.
-3. No mapa de conexões visuais do **qpwgraph**:
-* Localize o nó de saída de áudio referente ao `python3` ou `pygame`.
-* Arraste a conexão de saída do bot até o nó de entrada do **Nerimity** (ou para o seu microfone virtual/loopback conectado ao canal de voz).
-
-
-4. **Atenção:** Desconecte ou desligue o seu microfone principal no canal se não quiser que ele interfira na transmissão do bot.
-
----
-
-## ▶️ Como Rodar o Bot
-
-Execute o comando no terminal utilizando o interpretador do ambiente virtual criado:
+### 2. Crie um ambiente virtual (recomendado)
 
 ```bash
-~/venv/bin/python3 /home/user/bot.py
-
+python3 -m venv venv
+source venv/bin/activate      # Linux/macOS
+# venv\Scripts\activate       # Windows
 ```
 
-Quando a inicialização for concluída, o terminal exibirá:
+### 3. Instale as dependências
 
-```text
+```bash
+pip install -r requirements.txt
+```
+
+Se preferir instalar manualmente, sem o `requirements.txt`:
+
+```bash
+pip install nerimity_sdk aiortc av numpy edge-tts
+```
+
+> 💡 O `aiortc` e o `av` já trazem o `ffmpeg` embutido para decodificar áudio, então normalmente não é preciso instalar nada a mais no sistema. Se aparecer algum erro relacionado a `libav`/`ffmpeg` faltando, instale o ffmpeg do seu sistema:
+>
+> ```bash
+> # Ubuntu/Debian
+> sudo apt install ffmpeg
+>
+> # macOS (Homebrew)
+> brew install ffmpeg
+> ```
+
+### 4. Pegue o token do seu bot
+
+1. Acesse as configurações de desenvolvedor da sua conta na Nerimity: `https://nerimity.com/app/settings/developer`
+2. Crie um bot e copie o **token**.
+3. Convide o bot para o seu servidor com permissão para ler mensagens e entrar em canais de voz.
+
+### 5. Pegue os IDs dos canais
+
+No app da Nerimity, ative o **modo desenvolvedor** (se disponível) ou copie o ID pela URL do canal ao clicar nele. Você vai precisar de:
+
+- ID do **canal de texto** que o bot vai "escutar".
+- ID do **canal de voz** que o bot vai entrar.
+
+### 6. Configure o `bot.py`
+
+Abra o arquivo `bot.py` e edite o topo com suas informações:
+
+```python
+TOKEN = "SEU_TOKEN_AQUI"
+CANAL_TEXTO_ID = "ID_DO_CANAL_DE_TEXTO"
+CANAL_VOZ_ID = "ID_DO_CANAL_DE_VOZ"
+VOZ = "pt-BR-AntonioNeural"  # voz do TTS (veja a lista abaixo)
+```
+
+### 7. Rode o bot
+
+```bash
+python bot.py
+```
+
+Se tudo der certo, você verá algo como:
+
+```
 🔄 Iniciando o Bot com o SDK oficial...
-
+✅ Conectado como SeuBot
+🔊 Entrou no canal de voz ...
 ```
 
-Envie qualquer texto em **MAIÚSCULAS** no canal configurado para que o bot faça a leitura no formato:
+Agora é só mandar uma mensagem **EM CAPS LOCK** no canal de texto configurado — o bot vai gerar o áudio e falar na call.
+
+---
+
+## 🎙️ Trocando a voz do TTS
+
+O `edge-tts` suporta várias vozes em português e outros idiomas. Para listar todas as vozes disponíveis:
+
+```bash
+edge-tts --list-voices | grep pt-BR
+```
+
+Exemplos de vozes em português do Brasil:
+
+| Voz | Gênero |
+|---|---|
+| `pt-BR-AntonioNeural` | Masculina |
+| `pt-BR-FranciscaNeural` | Feminina |
+
+Basta trocar o valor de `VOZ` no topo do `bot.py`.
+
+---
+
+## 🗂️ Estrutura do projeto
+
+```
+.
+├── bot.py             # código principal do bot
+├── requirements.txt   # dependências Python
+└── README.md          # esta documentação
+```
+
+---
+
+## 🔧 Como funciona (visão geral técnica)
+
+1. O bot conecta ao gateway (WebSocket) da Nerimity usando o `nerimity_sdk`.
+2. Assim que fica pronto (`evento ready`), chama o endpoint REST `POST /channels/{id}/voice/join` para entrar no canal de voz.
+3. Para cada participante já presente ou que entra depois, o bot negocia uma conexão **WebRTC ponto a ponto** (oferta/resposta SDP + candidatos ICE), trocando essas mensagens pelos eventos de socket `voice:signal_send` / `voice:signal_received` — exatamente como o cliente web oficial faz internamente com a biblioteca `simple-peer`.
+4. Quando uma mensagem em CAIXA ALTA chega no canal de texto configurado, o bot gera o áudio com `edge-tts`, decodifica para PCM com `av` (PyAV) e envia esse áudio por dentro de cada conexão WebRTC ativa, usando `aiortc`.
+
+---
+
+## ❓ Solução de problemas
+
+**`ModuleNotFoundError: No module named 'av'` (ou `aiortc`, `edge_tts`, `nerimity_sdk`)**
+→ As dependências não foram instaladas no ambiente Python que você está usando para rodar o bot. Rode `pip install -r requirements.txt` dentro do mesmo venv/interpretador usado para executar o `bot.py`.
+
+**O bot entra na call mas ninguém ouve nada**
+→ Verifique no console as linhas `[RTC] <usuario>: <estado>`. Se o estado nunca chega a `connected`, pode ser um problema de conectividade ICE/TURN (rede com firewall restritivo, por exemplo).
+
+**O bot lê a própria mensagem e entra em loop**
+→ Confirme que o token configurado é o do bot correto e que o evento `ready` está disparando (deve aparecer `✅ Conectado como ...` no console).
+
+**Erro relacionado a `ffmpeg`/`libav`**
+→ Instale o ffmpeg no sistema operacional (veja o passo 3 acima).
+
+---
+
+## 📜 Licença
+
+Escolha e adicione a licença de sua preferência (MIT, GPL, etc.) em um arquivo `LICENSE`.
