@@ -5,8 +5,8 @@ import edge_tts
 from nerimity_sdk import Bot
 
 # --- CONFIGURAÇÕES ---
-TOKEN = "BOT TOKEN"
-CANAL_ID = "CANAL DE VOZ"
+TOKEN = "XXXXX"
+CANAL_ID = "XXXXX"
 VOZ = "pt-BR-AntonioNeural" # Voz masculina padrão
 
 # Inicializa o player de áudio do Pygame
@@ -55,8 +55,8 @@ async def on_message(event):
 
         conteudo = getattr(msg, "content", "")
         
-        # Se houver texto, monta a frase perfeita e fala
-        if conteudo:
+        # Só lê se houver texto E se estiver 100% em CAPS LOCK
+        if conteudo and conteudo.isupper():
             texto_para_falar = f"{autor} disse: {conteudo}"
             print(f"👉 Lendo no chat: {texto_para_falar}")
             
