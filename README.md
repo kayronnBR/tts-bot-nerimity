@@ -35,14 +35,7 @@ Ou seja: funciona hoje, mas **não é um recurso oficialmente suportado**. Se a 
 
 ## 🚀 Instalação — passo a passo
 
-### 1. Clone o repositório
-
-```bash
-git clone https://github.com/SEU_USUARIO/SEU_REPOSITORIO.git
-cd SEU_REPOSITORIO
-```
-
-### 2. Crie um ambiente virtual (recomendado)
+### 1. Crie um ambiente virtual (recomendado)
 
 ```bash
 python3 -m venv venv
@@ -50,7 +43,7 @@ source venv/bin/activate      # Linux/macOS
 # venv\Scripts\activate       # Windows
 ```
 
-### 3. Instale as dependências
+### 2. Instale as dependências
 
 ```bash
 pip install -r requirements.txt
@@ -72,20 +65,20 @@ pip install nerimity_sdk aiortc av numpy edge-tts
 > brew install ffmpeg
 > ```
 
-### 4. Pegue o token do seu bot
+### 3. Pegue o token do seu bot
 
 1. Acesse as configurações de desenvolvedor da sua conta na Nerimity: `https://nerimity.com/app/settings/developer`
 2. Crie um bot e copie o **token**.
 3. Convide o bot para o seu servidor com permissão para ler mensagens e entrar em canais de voz.
 
-### 5. Pegue os IDs dos canais
+### 4. Pegue os IDs dos canais
 
 No app da Nerimity, ative o **modo desenvolvedor** (se disponível) ou copie o ID pela URL do canal ao clicar nele. Você vai precisar de:
 
 - ID do **canal de texto** que o bot vai "escutar".
 - ID do **canal de voz** que o bot vai entrar.
 
-### 6. Configure o `bot.py`
+### 5. Configure o `bot.py`
 
 Abra o arquivo `bot.py` e edite o topo com suas informações:
 
@@ -96,7 +89,7 @@ CANAL_VOZ_ID = "ID_DO_CANAL_DE_VOZ"
 VOZ = "pt-BR-AntonioNeural"  # voz do TTS (veja a lista abaixo)
 ```
 
-### 7. Rode o bot
+### 6. Rode o bot
 
 ```bash
 python bot.py
