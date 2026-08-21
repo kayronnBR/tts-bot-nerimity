@@ -39,8 +39,6 @@ Ou seja: funciona hoje, mas **não é um recurso oficialmente suportado**. Se a 
 
 ```bash
 python3 -m venv venv
-source venv/bin/activate      # Linux/macOS
-# venv\Scripts\activate       # Windows
 ```
 
 ### 2. Instale as dependências
