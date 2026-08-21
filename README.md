@@ -44,11 +44,7 @@ python3 -m venv venv
 ### 2. Instale as dependências
 
 ```bash
-pip install nerimity_sdk aiortc av numpy edge-tts
-```
-pip install nerimity_sdk aiortc av numpy edge-tts
-```bash
-pip install --break-system-packages nerimity_sdk aiortc av numpy edge-tts
+~/venv/bin/pip install nerimity_sdk aiortc av numpy edge-tts
 ```
 
 Se preferir instalar manualmente, sem o `requirements.txt`:
