@@ -1,108 +1,104 @@
-# tts-bot-nerimity
+# 🤖 Bot TTS Nerimity
 
-<p align="center">
-  <img src="https://img.shields.io/badge/Python-3.x-blue.svg" alt="Python Version">
-  <img src="https://img.shields.io/badge/Platform-Nerimity-purple.svg" alt="Platform">
-</p>
+Um bot para o **Nerimity** que converte mensagens de texto enviadas em caixa alta em áudio (*Text-to-Speech*), utilizando a voz neural em português da Microsoft, e reproduz o som no seu sistema.
 
 ---
 
-## 🇧🇷 Português
+## ⚠️ Requisitos e Regras de Funcionamento
 
-Um bot para a plataforma Nerimity que converte as mensagens de texto do chat em voz (Text-to-Speech) em tempo real.
+* **Uso em Call:** Para que os membros do servidor ou da chamada ouçam o áudio do bot, você **deve obrigatoriamente estar conectado a um canal de voz no Nerimity** e redirecionar a saída de áudio do sistema para a sua transmissão ou microfone virtual.
+* **Mensagens em CAPSLOCK:** O bot lê **apenas** mensagens enviadas inteiramente em caixa alta (**CAPSLOCK**). Mensagens enviadas em letras minúsculas ou misturadas serão ignoradas.
 
-### 🚀 Como Configurar e Executar
+---
 
-Siga os passos abaixo no seu terminal para preparar o ambiente e rodar o bot.
+## 🛠️ Instalação e Pré-requisitos
 
-#### 1. Criar o Ambiente Virtual
-Crie uma pasta para o ambiente virtual na sua rota pessoal (`~`):
-```bash
-python3 -m venv ~/venv
+### 1. Dependências do Sistema (Linux Mint)
+Instale o **qpwgraph** (gerenciador gráfico de áudio do PipeWire) via loja de aplicativos ou Flatpak:
 
-```
+* **Download:** [Flathub - qpwgraph](https://flathub.org/en/apps/org.rncbc.qpwgraph)
 
-#### 2. Atualizar o Gerenciador de Pacotes
-
-Acesse o ambiente criado e atualize o `pip`:
+### 2. Configuração do Ambiente Virtual Python
+Crie o ambiente virtual no seu repositório local e instale as bibliotecas necessárias:
 
 ```bash
-~/venv/bin/pip install --upgrade pip
+# Cria o ambiente virtual
+python3 -m venv ~/venv 
 
-```
-
-#### 3. Instalar as Dependências
-
-Instale todas as bibliotecas necessárias de uma só vez:
-
-```bash
-~/venv/bin/pip install nerimity-sdk edge-tts pygame sounddevice
-
-```
-
-### ⚙️ Configuração Importante
-
-Antes de rodar, abra o arquivo do bot e **modifique o Token do bot e o ID do canal** para os correspondentes da sua aplicação.
-
-### 🏃 Como Executar
-
-Para colocar o bot para funcionar, execute o comando abaixo (lembre-se de ajustar o caminho `/home/kayronn/...` para a pasta onde o seu arquivo está salvo):
-
-```bash
-~/venv/bin/python3 /home/kayronn/Downloads/bot.py
+# Ativa o ambiente e instala as dependências
+~/venv/bin/pip install pygame edge-tts nerimity-sdk
 
 ```
 
 ---
 
-## 🇺🇸 English
+## 📁 Estrutura de Arquivos
 
-A bot for the Nerimity platform that converts chat text messages into voice (Text-to-Speech) in real-time.
+Certifique-se de salvar o código do bot no caminho especificado abaixo (ou no diretório de sua preferência):
 
-### 🚀 Setup and Installation
+```plaintext
+/home/user/bot.py
 
-Follow the steps below in your terminal to set up the environment and run the bot.
+```
 
-#### 1. Create the Virtual Environment
+---
 
-Create a folder for the virtual environment in your home directory (`~`):
+## configurando token e canal onde o bot vai ler
+
+abre o arquivo bot.py e procure:
+TOKEN = "XXXXX"
+CANAL_ID = "XXXXX"
+
+onde tem os XXX altere para os codigo que vai pedir.
+
+sobre o token você precisa criar um bot no nerimity para monitorar o chat para gerar o audio
+1- https://nerimity.com/app/settings/developer/applications
+2- click em "adicionar aplicativo"
+3- defina o nome dele e volta para tela dos aplicativos
+4- selecione o bot que você criou
+5- click em "usuario do bot"
+6- copie o token e cole no arquivo do bot.py
+
+exemplo do resultado como vai ficar:
+TOKEN = "5M3vVeGvBDQbrFAMUJem"
+
+e para pegar o id do canal é facil
+1- entre no seu servidor
+2- click direito no canal
+3- "copiar id"
+
+agora volte no bot,py e altere, exemplo do resultado final
+CANAL_ID = "5M3vVeGvBDQbrFAMUJem"
+
+## 🎧 Configuração de Áudio (PipeWire + qpwgraph)
+
+Para redirecionar o som do bot para o Nerimity:
+
+1. Inicie a execução do bot no terminal.
+2. Abra o aplicativo **qpwgraph**.
+3. No mapa de conexões visuais do **qpwgraph**:
+* Localize o nó de saída de áudio referente ao `python3` ou `pygame`.
+* Arraste a conexão de saída do bot até o nó de entrada do **Nerimity** (ou para o seu microfone virtual/loopback conectado ao canal de voz).
+
+
+4. **Atenção:** Desconecte ou desligue o seu microfone principal no canal se não quiser que ele interfira na transmissão do bot.
+
+---
+
+## ▶️ Como Rodar o Bot
+
+Execute o comando no terminal utilizando o interpretador do ambiente virtual criado:
 
 ```bash
-python3 -m venv ~/venv
+~/venv/bin/python3 /home/user/bot.py
 
 ```
 
-#### 2. Upgrade the Package Manager
+Quando a inicialização for concluída, o terminal exibirá:
 
-Access the created environment and upgrade `pip`:
-
-```bash
-~/venv/bin/pip install --upgrade pip
+```text
+🔄 Iniciando o Bot com o SDK oficial...
 
 ```
 
-#### 3. Install Dependencies
-
-Install all the required libraries at once:
-
-```bash
-~/venv/bin/pip install nerimity-sdk edge-tts pygame sounddevice
-
-```
-
-### ⚙️ Important Configuration
-
-Before running the bot, open the script file and **change the bot Token and Channel ID** to match your application settings.
-
-### 🏃 Running the Bot
-
-To start the bot, run the following command (make sure to update the path `/home/kayronn/...` to the folder where your file is actually located):
-
-```bash
-~/venv/bin/python3 /home/kayronn/Downloads/bot.py
-
-```
-
-```
-
-```
+Envie qualquer texto em **MAIÚSCULAS** no canal configurado para que o bot faça a leitura no formato:
