@@ -46,7 +46,11 @@ source venv/bin/activate      # Linux/macOS
 ### 2. Instale as dependências
 
 ```bash
-pip install -r requirements.txt
+pip install nerimity_sdk aiortc av numpy edge-tts
+```
+pip install nerimity_sdk aiortc av numpy edge-tts
+```bash
+pip install --break-system-packages nerimity_sdk aiortc av numpy edge-tts
 ```
 
 Se preferir instalar manualmente, sem o `requirements.txt`:
