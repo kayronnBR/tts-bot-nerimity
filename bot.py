@@ -171,6 +171,7 @@ class VoiceSession:
         self.my_user_id: Optional[str] = None
         self.peers: Dict[str, RTCPeerConnection] = {}
         self.tracks: Dict[str, TTSAudioTrack] = {}
+        self._drain_tasks: Dict[str, list] = {}
         self._connected = False
 
     # -- ciclo de vida --------------------------------------------------
@@ -188,6 +189,10 @@ class VoiceSession:
     async def leave(self) -> None:
         for pc in list(self.peers.values()):
             await pc.close()
+        for tasks in self._drain_tasks.values():
+            for task in tasks:
+                task.cancel()
+        self._drain_tasks.clear()
         self.peers.clear()
         self.tracks.clear()
         if self._connected:
@@ -203,6 +208,7 @@ class VoiceSession:
         pc.addTrack(track)
         self.peers[user_id] = pc
         self.tracks[user_id] = track
+        self._drain_tasks.setdefault(user_id, [])
 
         @pc.on("connectionstatechange")
         async def on_state_change():
@@ -210,12 +216,33 @@ class VoiceSession:
             if pc.connectionState in ("failed", "closed", "disconnected"):
                 await self._remover_conexao(user_id)
 
+        @pc.on("track")
+        def on_track(remote_track):
+            # IMPORTANTE: o aiortc guarda o áudio recebido de cada participante
+            # numa fila SEM LIMITE (RemoteStreamTrack._queue). Se ninguém
+            # nunca chama .recv() nela, essa fila cresce pra sempre enquanto
+            # a pessoa fica na call - é a maior causa de vazamento de memória
+            # aqui. Como o bot só precisa FALAR (não escutar), a gente
+            # consome e descarta esse áudio continuamente pra fila nunca
+            # acumular.
+            print(f"[RTC] {user_id}: recebendo faixa '{remote_track.kind}', descartando (bot não escuta).")
+            drain_task = asyncio.create_task(self._descartar_audio_recebido(user_id, remote_track))
+            self._drain_tasks[user_id].append(drain_task)
+
         # Watchdog: se essa conexão nunca sair de "connecting"/"new" dentro
         # do prazo, ela é considerada travada (zumbi) e é fechada sozinha —
         # evita que fiquem se acumulando pra sempre em memória.
         asyncio.create_task(self._watchdog_conexao(user_id, pc))
 
         return pc
+
+    async def _descartar_audio_recebido(self, user_id: str, remote_track) -> None:
+        try:
+            while True:
+                await remote_track.recv()
+        except Exception:
+            # a faixa terminou (usuário saiu, mudou de mic, conexão fechou etc.)
+            pass
 
     async def _watchdog_conexao(self, user_id: str, pc: RTCPeerConnection) -> None:
         await asyncio.sleep(PEER_CONNECT_TIMEOUT)
@@ -226,6 +253,8 @@ class VoiceSession:
     async def _remover_conexao(self, user_id: str) -> None:
         pc = self.peers.pop(user_id, None)
         self.tracks.pop(user_id, None)
+        for task in self._drain_tasks.pop(user_id, []):
+            task.cancel()
         if pc:
             await pc.close()
 
