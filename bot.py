@@ -56,6 +56,15 @@ SAMPLE_RATE = 48000
 FRAME_MS = 20
 SAMPLES_PER_FRAME = SAMPLE_RATE * FRAME_MS // 1000  # 960 amostras por quadro
 
+# Limite de segurança: no máximo ~30s de áudio pendente por conexão.
+# Se uma conexão travar sem consumir a fila, ela para de crescer aqui
+# em vez de estourar a memória do computador.
+MAX_QUEUE_FRAMES = (30 * 1000) // FRAME_MS
+
+# Tempo máximo (segundos) que uma conexão pode ficar "connecting" antes
+# de ser considerada morta e fechada automaticamente.
+PEER_CONNECT_TIMEOUT = 20
+
 # Servidores STUN/TURN usados pelo cliente oficial da Nerimity
 # (retirados do código-fonte público de nerimity-web, useVoiceUsers.ts)
 ICE_SERVERS = [
@@ -93,6 +102,15 @@ class TTSAudioTrack(MediaStreamTrack):
     async def push_pcm(self, pcm_bytes: bytes) -> None:
         frame_bytes = SAMPLES_PER_FRAME * 2  # 16 bits = 2 bytes/amostra
         for i in range(0, len(pcm_bytes), frame_bytes):
+            # Trava de segurança: se a fila já está cheia (conexão travada,
+            # não está consumindo), descarta o áudio mais velho em vez de
+            # crescer sem limite e estourar a memória.
+            if self._queue.qsize() >= MAX_QUEUE_FRAMES:
+                try:
+                    self._queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+
             chunk = pcm_bytes[i:i + frame_bytes]
             if len(chunk) < frame_bytes:
                 chunk += b"\x00" * (frame_bytes - len(chunk))
@@ -123,16 +141,24 @@ class TTSAudioTrack(MediaStreamTrack):
 
 
 def decodificar_mp3_para_pcm(caminho: str) -> bytes:
-    """Decodifica o mp3 gerado pelo edge-tts para PCM 16-bit mono 48kHz."""
+    """Decodifica o mp3 gerado pelo edge-tts para PCM 16-bit mono 48kHz.
+
+    Se o arquivo vier vazio/corrompido (ex.: falha de rede no edge-tts),
+    levanta a exceção de volta para quem chamou tratar — mas garante que
+    o container do PyAV/FFmpeg é sempre fechado, mesmo em erro, pra não
+    vazar memória/descritores de arquivo a cada falha.
+    """
     container = av.open(caminho)
-    stream = container.streams.audio[0]
-    resampler = av.AudioResampler(format="s16", layout="mono", rate=SAMPLE_RATE)
-    pcm = bytearray()
-    for frame in container.decode(stream):
-        for rframe in resampler.resample(frame):
-            pcm += bytes(rframe.planes[0])
-    container.close()
-    return bytes(pcm)
+    try:
+        stream = container.streams.audio[0]
+        resampler = av.AudioResampler(format="s16", layout="mono", rate=SAMPLE_RATE)
+        pcm = bytearray()
+        for frame in container.decode(stream):
+            for rframe in resampler.resample(frame):
+                pcm += bytes(rframe.planes[0])
+        return bytes(pcm)
+    finally:
+        container.close()
 
 
 class VoiceSession:
@@ -181,11 +207,27 @@ class VoiceSession:
         @pc.on("connectionstatechange")
         async def on_state_change():
             print(f"[RTC] {user_id}: {pc.connectionState}")
-            if pc.connectionState in ("failed", "closed"):
-                self.peers.pop(user_id, None)
-                self.tracks.pop(user_id, None)
+            if pc.connectionState in ("failed", "closed", "disconnected"):
+                await self._remover_conexao(user_id)
+
+        # Watchdog: se essa conexão nunca sair de "connecting"/"new" dentro
+        # do prazo, ela é considerada travada (zumbi) e é fechada sozinha —
+        # evita que fiquem se acumulando pra sempre em memória.
+        asyncio.create_task(self._watchdog_conexao(user_id, pc))
 
         return pc
+
+    async def _watchdog_conexao(self, user_id: str, pc: RTCPeerConnection) -> None:
+        await asyncio.sleep(PEER_CONNECT_TIMEOUT)
+        if self.peers.get(user_id) is pc and pc.connectionState not in ("connected",):
+            print(f"[RTC] {user_id}: conexão travada em '{pc.connectionState}', fechando.")
+            await self._remover_conexao(user_id)
+
+    async def _remover_conexao(self, user_id: str) -> None:
+        pc = self.peers.pop(user_id, None)
+        self.tracks.pop(user_id, None)
+        if pc:
+            await pc.close()
 
     async def _enviar_sinal(self, to_user_id: str, signal: dict) -> None:
         await self.bot._gateway.emit(
@@ -219,10 +261,8 @@ class VoiceSession:
 
     async def ao_usuario_sair(self, payload: dict) -> None:
         user_id = payload.get("userId")
-        pc = self.peers.pop(user_id, None)
-        self.tracks.pop(user_id, None)
-        if pc:
-            await pc.close()
+        if user_id:
+            await self._remover_conexao(user_id)
 
     async def ao_receber_sinal(self, payload: dict) -> None:
         channel_id = payload.get("channelId")
@@ -268,11 +308,27 @@ class VoiceSession:
         """Gera o TTS e transmite pra todo mundo conectado na call."""
         if not self.tracks:
             print("⚠️ Ninguém conectado na call ainda (ou negociação em andamento); nada pra ouvir.")
+
         out_file = f"tts_temp_{int(time.time() * 1000)}.mp3"
-        communicate = edge_tts.Communicate(texto, voz)
-        await communicate.save(out_file)
         try:
-            pcm = decodificar_mp3_para_pcm(out_file)
+            communicate = edge_tts.Communicate(texto, voz)
+            await communicate.save(out_file)
+
+            if not os.path.exists(out_file) or os.path.getsize(out_file) == 0:
+                print("⚠️ edge-tts gerou um arquivo vazio (provável falha de rede); ignorando essa fala.")
+                return
+
+            try:
+                # decodificar_mp3_para_pcm é bloqueante (I/O + CPU); rodar em
+                # thread separada evita travar o loop de eventos do bot
+                # (heartbeat, socket, outras mensagens) enquanto decodifica.
+                pcm = await asyncio.to_thread(decodificar_mp3_para_pcm, out_file)
+            except Exception as exc:
+                # ex.: "packet queue is empty, aborting" - mp3 corrompido/
+                # incompleto. Não deixa o bot travar nem vazar: só ignora
+                # essa fala e segue funcionando.
+                print(f"⚠️ Falha ao decodificar áudio do TTS, ignorando essa fala: {exc}")
+                return
         finally:
             if os.path.exists(out_file):
                 os.remove(out_file)
