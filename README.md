@@ -116,98 +116,94 @@ Agora é só mandar uma mensagem **EM CAPS LOCK** no canal de texto configurado 
 
 ## 📦 O que tem no código
 
-O arquivo `bot.py` traz uma estrutura completa para gerenciar conexões de áudio via WebRTC e múltiplas salas simultâneas de forma dinâmica:
+O arquivo `bot.py` atualizado traz uma arquitetura robusta voltada para alta disponibilidade, segurança, gerenciamento dinâmico de múltiplas salas e otimização extrema de memória RAM:
 
-1. **Configurações Globais (`TOKEN`, `VOZ`, `ICE_SERVERS`)**:
-* Define o token de acesso do Nerimity, a voz padrão do Microsoft Edge TTS (`pt-BR-AntonioNeural`) e os servidores STUN/TURN (retirados do cliente web oficial da Nerimity) para estabelecer conexões WebRTC P2P.
-
-
-2. **Sistema de Segurança e Lista Negra (`USUARIOS_BLOQUEADOS`)**:
-* Conjunto (`set`) com IDs de usuários impedidos de utilizar comandos interativos na DM do bot.
+1. **Configurações e Parâmetros da Chamada (`TOKEN`, `VOZ`, `ICE_SERVERS`)**:
+* Armazena o token do bot, a voz do Microsoft Edge TTS (`pt-BR-AntonioNeural`) e os servidores STUN/TURN oficiais extraídos do cliente web da Nerimity para negociação ICE de conexões WebRTC.
 
 
-3. **Comando Mestre por Senha (`COMANDO_MESTRE`, `SENHA_MESTRE`)**:
-* Mecanismo de emergência via DM (`!master <senha>`) que desliga o bot de todas as chamadas ativas de uma só vez, independente de quem enviou ou se o usuário está na lista de bloqueados.
+2. **Sistema de Controle de Acesso e Bloqueio (`USUARIOS_BLOQUEADOS`)**:
+* Um conjunto (`set`) contendo IDs de usuários explicitamente impedidos de executar comandos (`!config`, `!sair`) nas mensagens diretas (DM) do bot.
 
 
-4. **Classe `TTSAudioTrack` (MediaStreamTrack)**:
-* Uma faixa de áudio customizada estendida do `aiortc` que emite silêncio contínuo até receber amostras de áudio PCM. Possui proteção por fila (`MAX_QUEUE_FRAMES`) para descartar pacotes antigos caso uma conexão WebRTC trave, evitando estouro de memória RAM.
+3. **Autenticação por Senha Mestre (`COMANDO_MESTRE`, `SENHA_MESTRE`)**:
+* Permite executar o comando `!master <senha>` via DM para desconectar o bot de todas as chamadas e resetar todas as salas ativas instantaneamente. Por ser autenticado via senha, funciona inclusive se enviado por usuários da lista de bloqueio.
 
 
-5. **Classe `VoiceSession**`:
-* Responsável por gerenciar a presença e o ciclo de vida do bot em **um canal de voz**. Controla a negociação SDP (Oferta/Resposta), troca de candidatos ICE, descarte de áudio recebido dos usuários (para economizar memória, já que o bot só transmite) e um *watchdog* de timeout para fechar conexões mortas/travadas.
+4. **Tratamento de Áudio com Prevenção de Inundação (`TTSAudioTrack`)**:
+* Subclasse de `MediaStreamTrack` do `aiortc`. Mantém um fluxo contínuo de pacotes em tempo real (20ms/frame) enviando silêncio até que o áudio PCM do TTS seja injetado.
+* Possui uma trava de segurança baseada na constante `MAX_QUEUE_FRAMES`: se uma conexão P2P travar e parar de consumir frames, os áudios antigos são descartados da fila em vez de acumularem na RAM.
 
 
-6. **Classes `Sala`, `FluxoConfig` e `GerenciadorSalas**`:
-* Permitem o gerenciamento de **múltiplas salas simultâneas** (pares de canal de texto + canal de voz) em servidores diferentes.
-* Gerenciam o fluxo conversacional passo a passo via DM (Mensagem Direta) quando um usuário digita `!config`.
+5. **Gerenciador de Conexão e Descarte Ativo de Áudio Recebido (`VoiceSession`)**:
+* Gerencia a presença e negociação SDP/ICE em um canal de voz.
+* **Consumo Ativo de Microfone**: Em redes WebRTC mesh, todos os participantes transmitem áudio para todos. Como o `aiortc` empilha áudios recebidos dos usuários numa fila sem limite (`RemoteStreamTrack._queue`), o bot roda a task `_descartar_audio_recebido` para ler e descartar continuamente todo o áudio dos outros participantes em segundo plano, impedindo vazamentos de memória por acúmulo de áudio.
+* **Watchdog de Conexão Zumbi**: A task `_watchdog_conexao` monitora conexões travadas nos estados `"connecting"` ou `"new"`. Se não estabelecerem comunicação em 20 segundos (`PEER_CONNECT_TIMEOUT`), a conexão é fechada e descartada automaticamente.
 
 
-7. **Função `decodificar_mp3_para_pcm**`:
-* Converte o arquivo MP3 gerado pelo `edge-tts` em fluxo de áudio PCM 16-bit Mono 48kHz usando o PyAV (`av`), rodando em uma thread assíncrona separada para não travar o loop do bot.
+6. **Decodificação Segura com Liberação de Recursos (`decodificar_mp3_para_pcm`)**:
+* Converte o arquivo MP3 gerado em PCM mono 16-bit 48kHz via PyAV/FFmpeg.
+* Utiliza bloco `try/finally` obrigatório para garantir o fechamento do container do FFmpeg (`container.close()`) mesmo que o arquivo venha corrompido ou incompleto (ex.: falha de pacote do `edge-tts` que gerava o erro `"packet queue is empty, aborting"`), impedindo o vazamento de descritores de arquivo.
+* A decodificação é executada em uma thread assíncrona separada (`asyncio.to_thread`) para evitar o bloqueio do loop de eventos principal do bot durante o processamento de CPU/IO.
+
+
+7. **Arquitetura Multi-Sala Assíncrona (`Sala`, `FluxoConfig`, `GerenciadorSalas`)**:
+* Permite que o bot esteja presente e ativo em múltiplas salas (duplas de canal de texto e voz) simultaneamente.
+* Gerencia estados de conversação interativa via DM (`ConfigState`) para criar novas salas passo a passo de forma isolada por usuário.
 
 
 
 ---
 
-## ⚙️ Como o bot funciona (Fluxo de Execução)
+## ⚙️ Como o bot funciona (Fluxo de Execução Técnica)
 
-O funcionamento interno do bot combina a API REST do Nerimity, eventos via Socket.IO/Gateway, WebRTC P2P e conversão de texto para fala:
+Abaixo está o ciclo de vida operacional detalhado do bot, desde a recepção de comandos até o envio do fluxo de voz WebRTC:
 
 ```
-[ Usuário digita em CAPS LOCK no canal de texto ]
-                       │
-                       ▼
-         [ Evento 'message:created' ]
-                       │
-                       ▼
-        [ Verifica se o texto é ISUPPER ]
-                       │
-                       ▼
-    [ Gera MP3 via edge-tts (Microsoft Neural) ]
-                       │
-                       ▼
-   [ Decodifica MP3 para PCM 48kHz (PyAV) ]
-                       │
-                       ▼
- [ Injeta áudio na fila do TTSAudioTrack no WebRTC ]
-                       │
-                       ▼
-[ Transmite áudio ao vivo pros usuários na call ]
+                  [ Evento 'message:created' ]
+                               │
+               ┌───────────────┴───────────────┐
+               ▼                               ▼
+        [ Mensagem em DM ]            [ Mensagem no Servidor ]
+               │                               │
+       ┌───────┴───────┐              [ Pertence a uma Sala Ativa? ]
+       ▼               ▼                       │
+ [ Comando !master ] [ Outros Comandos ]       ▼
+ [ Valida Senha ]   [ Checa Bloqueio ]  [ Texto em CAPS LOCK? ]
+       │               │                       │
+       ▼               ▼                       ▼
+ [ Reseta Salas ]   [!config / !sair]   [ Inicia Geração de TTS ]
 
 ```
 
-### Passo a passo detalhado:
+### Detalhamento dos Processos:
 
-1. **Conexão e Autenticação**:
-* O bot conecta no gateway WebSocket do Nerimity através do `nerimity_sdk`.
-
-
-2. **Configuração Interativa via DM**:
-* Um usuário envia `!config` na DM do bot.
-* O bot responde pedindo o **ID do canal de texto** e em seguida o **ID do canal de voz**.
-* O bot chama o endpoint REST `/channels/{id}/voice/join` para sinalizar sua entrada no canal de voz.
+1. **Configuração Dinâmica de Salas via DM**:
+* O usuário envia `!config` na DM do bot.
+* O `GerenciadorSalas` inicia um `FluxoConfig` no estado `AGUARDANDO_TEXTO` e solicita o ID do canal de texto.
+* Após o recebimento e validação, o estado passa para `AGUARDANDO_VOZ` e solicita o ID do canal de voz.
+* O bot aciona `bot.rest.join_voice()` para registrar presença no canal e cria a `VoiceSession`.
 
 
-3. **Sinalização e Conexão WebRTC (Mesh)**:
-* Quando um usuário entra no canal de voz (`voice:user_joined`), o bot escuta o evento e cria uma instância `RTCPeerConnection` (`aiortc`).
-* O bot cria uma oferta SDP (*offer*) e envia ao usuário via evento `voice:signal_send`.
-* O usuário responde com uma *answer* e candidatos ICE via `voice:signal_received`.
-* Uma conexão P2P direta de áudio é estabelecida entre o bot e o participante.
+2. **Negociação WebRTC Mesh**:
+* Quando um participante entra no canal de voz, o evento `voice:user_joined` dispara `ao_usuario_entrar`.
+* O bot cria uma oferta SDP via `RTCPeerConnection` (`aiortc`), envia via socket `voice:signal_send` e aguarda a resposta SDP e candidatos ICE via `voice:signal_received`.
+* Assim que estabelecida a conexão, o bot associa um `TTSAudioTrack` para transmissão e inicia o loop assíncrono para descartar o áudio que o usuário transmite na call.
 
 
-4. **Detecção e Geração de Fala**:
-* Ao receber uma mensagem em um canal de texto monitorado (`message:created`), o bot valida se o texto está **100% EM CAIXA ALTA** (`conteudo.isupper()`) e se não foi enviada por ele mesmo.
-* O texto é formatado no padrão: `"<Nome do Autor> disse: <MENSAGEM>"`.
-* O `edge-tts` baixa a fala em formato MP3 temporário.
-* O arquivo MP3 é decodificado para amostras brutas em PCM (48000 Hz, 16-bit, mono) via PyAV (`av`).
-* As amostras são enviadas em quadros de 20ms para o `TTSAudioTrack` de cada participante conectado na chamada WebRTC.
+3. **Ciclo de Processamento da Fala (TTS)**:
+* Uma mensagem em CAIXA ALTA (`isupper()`) postada no canal de texto cadastrado aciona a função `falar()`.
+* O bot gera o áudio MP3 utilizando `edge_tts.Communicate`.
+* O arquivo é validado (verificando se o tamanho é maior que 0 bytes para prevenir erros de rede/rate limit).
+* O áudio é decodificado via `decodificar_mp3_para_pcm` em thread separada, convertendo para PCM bruto de 48kHz.
+* O PCM é fatiado em blocos equivalentes a 20ms de áudio (`SAMPLES_PER_FRAME = 960` amostras) e inserido via `push_pcm()` na fila de cada participante ativo na chamada.
+* O arquivo MP3 temporário é excluído do disco no bloco `finally`.
 
 
-5. **Comandos Interativos em DM**:
-* `!config`: Inicia a criação de uma nova sala de voz/texto.
-* `!sair <id_canal_voz>`: Desconecta o bot e encerra a sala especificada.
-* `!master <senha>`: Comando mestre global que força o encerramento e desconexão de todas as salas ativas de uma só vez.
+4. **Gerenciamento de Comandos Disponíveis via DM**:
+* `!config`: Inicia o assistente de criação de uma nova sala (canal de texto + canal de voz).
+* `!sair <id_canal_voz>`: Remove o bot de uma chamada de voz específica e encerra a sala correspondente.
+* `!master <senha>`: Comando mestre global que força a desconexão de todas as chamadas e o encerramento de todas as salas cadastradas.
 
 
 
@@ -269,11 +265,3 @@ Basta trocar o valor de `VOZ` no topo do `bot.py`.
 → Instale o ffmpeg no sistema operacional (veja o passo 3 acima).
 
 ---
-
-## 📜 Licença
-
-Escolha e adicione a licença de sua preferência (MIT, GPL, etc.) em um arquivo `LICENSE`.
-
-```
-
-```
