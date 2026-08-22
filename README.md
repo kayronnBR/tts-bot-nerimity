@@ -1,6 +1,4 @@
-Aqui está o seu `README.md` **sem alterar nenhuma palavra do seu texto original**, contendo exatamente as novas sessões solicitadas sobre **o que tem no código** e **como ele funciona** (suporte a múltiplas salas via DM, controle de acesso/comandos e o fluxo técnico detalhado do `bot.py` atualizado):
 
-```markdown
 # 🤖 Nerimity TTS Voice Bot
 
 Bot para o [Nerimity](https://nerimity.com) que **entra automaticamente em um canal de voz** e **fala em voz alta** (usando TTS da Microsoft/Edge) qualquer mensagem escrita **EM CAPS LOCK** em um canal de texto.
