@@ -27,8 +27,9 @@ em vez de tocar no alto-falante do computador que roda o bot.
 import asyncio
 import fractions
 import os
+import re
 import time
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import av
 import numpy as np
@@ -50,12 +51,14 @@ from nerimity_sdk import Bot
 TOKEN = "XXXXX"
 VOZ = "pt-BR-AntonioNeural"  # Voz masculina padrão
 
-# Comandos que qualquer pessoa (não bloqueada) pode mandar na DM do bot.
-COMANDO_CONFIG = "!config"
-COMANDO_SAIR = "!sair"   # !sair <id_do_canal_de_voz> -> tira o bot só daquela call
+# Comando pra sair da call. Uso: "!sair tts" (a palavra "tts" é fixa —
+# tira o bot da sala que essa conversa (DM) criou, sem precisar saber o
+# ID do canal de voz de cor).
+COMANDO_SAIR = "!sair"
+ARGUMENTO_SAIR = "tts"
 
 # --- CONTROLE DE ACESSO ---
-# IDs de usuários que NUNCA podem usar os comandos do bot (!config / !sair).
+# IDs de usuários que NUNCA podem usar os comandos do bot.
 # Adicione manualmente os IDs aqui, como texto, um por linha.
 USUARIOS_BLOQUEADOS = {
     # "123456789012345678",
@@ -65,8 +68,9 @@ USUARIOS_BLOQUEADOS = {
 # Comando de senha mestre: SEMPRE reseta TODAS as salas de uma vez (tira o
 # bot de todas as calls), não importa quem manda - inclusive gente bloqueada
 # - porque a autenticação aqui é pela senha, não pelo ID de quem enviou.
-# É a ÚNICA forma de resetar tudo de uma vez; "!sair" só tira de uma call
-# por vez. Troque o valor abaixo antes de rodar o bot; use algo só seu.
+# É a ÚNICA forma de resetar tudo de uma vez; "!sair tts" só tira a sala
+# criada por aquela conversa específica. Troque o valor abaixo antes de
+# rodar o bot; use algo só seu.
 # Uso: mande "!master SUA_SENHA_AQUI" na DM do bot.
 COMANDO_MESTRE = "!master"
 SENHA_MESTRE = "TROQUE_ESSA_SENHA"
@@ -384,11 +388,6 @@ class VoiceSession:
         await asyncio.gather(*(track.push_pcm(pcm) for track in self.tracks.values()))
 
 
-class ConfigState:
-    AGUARDANDO_TEXTO = "aguardando_texto"
-    AGUARDANDO_VOZ = "aguardando_voz"
-
-
 class Sala:
     """Uma sala = um par (canal de texto que o bot escuta) + (canal de voz
     onde ele fala). O bot pode ter várias salas ativas ao mesmo tempo, cada
@@ -400,27 +399,58 @@ class Sala:
         self.voice_session = voice_session
 
 
-class FluxoConfig:
-    """Estado de uma configuração em andamento numa DM específica.
-    Cada pessoa configurando uma sala nova tem o seu próprio fluxo,
-    então várias pessoas podem estar configurando salas diferentes ao
-    mesmo tempo, em servidores diferentes, sem interferir uma na outra."""
+# --- MODELO QUE A PESSOA PREENCHE NO PRIVADO -------------------------------
+# Em vez de um fluxo de pergunta-resposta (!config -> pergunta canal de
+# texto -> espera resposta -> pergunta canal de voz -> espera resposta),
+# o bot manda um modelo pronto. A pessoa copia, preenche os dois IDs e
+# manda de volta numa única mensagem; o bot lê e já entra na call.
+_LABEL_TEXTO = "ID do canal de texto"
+_LABEL_VOZ = "ID do canal de voz"
 
-    def __init__(self, dm_channel_id: str, user_id: str):
-        self.dm_channel_id = dm_channel_id
-        self.user_id = user_id
-        self.estado = ConfigState.AGUARDANDO_TEXTO
-        self.canal_texto_id: Optional[str] = None
+MODELO_MENSAGEM = (
+    "👋 Pra eu entrar numa call, copia o texto abaixo, preenche os dois IDs "
+    "(um em cada linha, depois dos dois-pontos) e manda de volta pra mim "
+    "numa única mensagem:\n\n"
+    "```\n"
+    f"{_LABEL_TEXTO}: \n"
+    f"{_LABEL_VOZ}: \n"
+    "```\n\n"
+    f"Pra eu sair da call depois, manda `{COMANDO_SAIR} {ARGUMENTO_SAIR}` "
+    "no canal de TEXTO que você definiu (não aqui no privado)."
+)
+
+_PADRAO_TEXTO = re.compile(rf"(?im)^\s*{re.escape(_LABEL_TEXTO)}\s*:\s*(\S+)\s*$")
+_PADRAO_VOZ = re.compile(rf"(?im)^\s*{re.escape(_LABEL_VOZ)}\s*:\s*(\S+)\s*$")
+
+
+def extrair_ids_do_modelo(texto: str) -> Optional[Tuple[str, str]]:
+    """Tenta ler uma mensagem no formato do MODELO_MENSAGEM (as duas linhas
+    'ID do canal de texto: ...' e 'ID do canal de voz: ...') e devolve
+    (id_texto, id_voz) se as duas vierem preenchidas. Devolve None se a
+    mensagem não bater com esse formato (então não é uma resposta ao
+    modelo, é só uma mensagem qualquer)."""
+    m_texto = _PADRAO_TEXTO.search(texto or "")
+    m_voz = _PADRAO_VOZ.search(texto or "")
+    if m_texto and m_voz:
+        return m_texto.group(1).strip(), m_voz.group(1).strip()
+    return None
 
 
 class GerenciadorSalas:
-    """Gerencia todas as salas (calls) ativas do bot e os fluxos de
-    configuração em andamento em cada DM.
+    """Gerencia todas as salas (calls) ativas do bot.
 
-    Comandos (mandados na DM do bot, por qualquer pessoa):
-      !config              -> começa a configurar uma sala nova
-      !reset <id_da_voz>   -> desliga só aquela sala específica
-      !reset               -> desliga TODAS as salas ativas
+    No PRIVADO do bot (por qualquer pessoa):
+      <qualquer mensagem que não seja o modelo preenchido> -> manda o
+                                                                modelo pra
+                                                                preencher
+      <modelo preenchido com os dois IDs>                   -> já entra na
+                                                                call
+      !master <senha>                                        -> reseta
+                                                                TODAS as
+                                                                salas
+
+    No canal de TEXTO que a sala está escutando (não no privado):
+      !sair tts -> tira o bot da call e desliga aquela sala
     """
 
     def __init__(self, bot: Bot):
@@ -428,7 +458,7 @@ class GerenciadorSalas:
         self.my_user_id: Optional[str] = None
         self.salas_por_texto: Dict[str, Sala] = {}   # canal_texto_id -> Sala
         self.salas_por_voz: Dict[str, Sala] = {}      # canal_voz_id  -> Sala
-        self.fluxos: Dict[str, FluxoConfig] = {}       # dm_channel_id -> FluxoConfig
+        self.salas_por_dm: Dict[str, Sala] = {}       # dm_channel_id -> Sala (quem criou)
 
     async def _enviar_dm(self, channel_id: str, texto: str) -> None:
         if channel_id:
@@ -440,81 +470,74 @@ class GerenciadorSalas:
     def sala_por_canal_voz(self, canal_voz_id: str) -> Optional[Sala]:
         return self.salas_por_voz.get(canal_voz_id)
 
-    # -- configuração (DM) --------------------------------------------------
+    # -- criar sala a partir do modelo preenchido ----------------------------
 
-    async def iniciar_config(self, dm_channel_id: str, user_id: str) -> None:
-        fluxo = FluxoConfig(dm_channel_id, user_id)
-        self.fluxos[dm_channel_id] = fluxo
-        await self._enviar_dm(
-            dm_channel_id,
-            "👋 Vamos criar uma sala nova! Me manda o **ID do canal de TEXTO** "
-            "que devo escutar (onde vou ler as mensagens em CAIXA ALTA).",
-        )
-
-    async def processar_resposta_dm(self, dm_channel_id: str, texto: str) -> None:
-        fluxo = self.fluxos.get(dm_channel_id)
-        if not fluxo:
-            return
-        texto = (texto or "").strip()
-        if not texto:
-            return
-
-        if fluxo.estado == ConfigState.AGUARDANDO_TEXTO:
-            if texto in self.salas_por_texto:
-                await self._enviar_dm(
-                    dm_channel_id,
-                    "⚠️ Esse canal de texto já está sendo escutado por outra sala. "
-                    "Manda outro ID de canal de texto, ou tira o bot daquela sala antes "
-                    f"com `{COMANDO_SAIR} <id_do_canal_de_voz_dela>`.",
-                )
-                return
-            fluxo.canal_texto_id = texto
-            fluxo.estado = ConfigState.AGUARDANDO_VOZ
-            await self._enviar_dm(dm_channel_id, f"✅ Canal de texto definido: `{texto}`")
-            await self._enviar_dm(dm_channel_id, "🎙️ Agora me manda o **ID do canal de VOZ** que devo entrar.")
-
-        elif fluxo.estado == ConfigState.AGUARDANDO_VOZ:
-            if texto in self.salas_por_voz:
-                await self._enviar_dm(
-                    dm_channel_id, "⚠️ Já estou nesse canal de voz em outra sala. Manda outro ID de canal de voz."
-                )
-                return
-
-            voice_session = VoiceSession(self.bot, texto)
-            voice_session.my_user_id = self.my_user_id
-            try:
-                await voice_session.join()
-            except Exception as exc:
-                print(f"❌ Não consegui entrar na call: {exc}")
-                await self._enviar_dm(
-                    dm_channel_id,
-                    f"❌ Não consegui entrar nesse canal de voz ({exc}). Confere o ID e me manda de novo.",
-                )
-                return  # continua em AGUARDANDO_VOZ pra tentar de novo
-
-            sala = Sala(fluxo.canal_texto_id, texto, voice_session)
-            self.salas_por_texto[fluxo.canal_texto_id] = sala
-            self.salas_por_voz[texto] = sala
-            del self.fluxos[dm_channel_id]
-
+    async def criar_sala(self, dm_channel_id: str, canal_texto_id: str, canal_voz_id: str) -> None:
+        if dm_channel_id in self.salas_por_dm:
             await self._enviar_dm(
                 dm_channel_id,
-                "🎉 Tudo pronto! Já entrei nessa call e vou falar as mensagens em "
-                "CAIXA ALTA daquele canal.\n\n"
-                f"• Pra criar outra sala (em outro servidor, por exemplo): `{COMANDO_CONFIG}`\n"
-                f"• Pra tirar o bot só dessa call: `{COMANDO_SAIR} {texto}`",
+                "⚠️ Você já tem uma sala ativa criada por aqui. Vá até o canal de texto "
+                f"dela e manda `{COMANDO_SAIR} {ARGUMENTO_SAIR}` antes de criar outra.",
             )
+            return
+
+        if canal_texto_id in self.salas_por_texto:
+            await self._enviar_dm(
+                dm_channel_id,
+                "⚠️ Esse canal de texto já está sendo escutado por outra sala. "
+                "Preenche o modelo com outro ID de canal de texto.",
+            )
+            return
+
+        if canal_voz_id in self.salas_por_voz:
+            await self._enviar_dm(
+                dm_channel_id,
+                "⚠️ Já estou nesse canal de voz em outra sala. Preenche o modelo "
+                "com outro ID de canal de voz.",
+            )
+            return
+
+        voice_session = VoiceSession(self.bot, canal_voz_id)
+        voice_session.my_user_id = self.my_user_id
+        try:
+            await voice_session.join()
+        except Exception as exc:
+            print(f"❌ Não consegui entrar na call: {exc}")
+            await self._enviar_dm(
+                dm_channel_id,
+                f"❌ Não consegui entrar nesse canal de voz ({exc}). Confere os IDs "
+                "e manda o modelo preenchido de novo.",
+            )
+            return
+
+        sala = Sala(canal_texto_id, canal_voz_id, voice_session)
+        self.salas_por_texto[canal_texto_id] = sala
+        self.salas_por_voz[canal_voz_id] = sala
+        self.salas_por_dm[dm_channel_id] = sala
+
+        await self._enviar_dm(
+            dm_channel_id,
+            "🎉 Tudo pronto! Já entrei nessa call e vou falar as mensagens em "
+            "CAIXA ALTA daquele canal.\n\n"
+            f"Pra eu sair, manda `{COMANDO_SAIR} {ARGUMENTO_SAIR}` lá no canal "
+            "de texto (não aqui no privado).",
+        )
 
     # -- sair da call ---------------------------------------------------------
 
-    async def sair_da_sala(self, dm_channel_id: str, canal_voz_id: str) -> None:
-        sala = self.salas_por_voz.pop(canal_voz_id, None)
+    async def sair_da_sala(self, canal_texto_id: str) -> None:
+        """Tira o bot da call escutada por esse canal de texto. Precisa ser
+        chamado com o ID do canal de texto onde o comando foi mandado —
+        é assim que o bot sabe qual sala desligar."""
+        sala = self.salas_por_texto.pop(canal_texto_id, None)
         if not sala:
-            await self._enviar_dm(dm_channel_id, f"Não achei nenhuma sala ativa no canal de voz `{canal_voz_id}`.")
-            return
-        self.salas_por_texto.pop(sala.canal_texto_id, None)
+            return  # nenhuma sala ativa nesse canal; nada a fazer
+        self.salas_por_voz.pop(sala.canal_voz_id, None)
+        for dm_channel_id, s in list(self.salas_por_dm.items()):
+            if s is sala:
+                del self.salas_por_dm[dm_channel_id]
         await sala.voice_session.leave()
-        await self._enviar_dm(dm_channel_id, f"🔇 Saí da call `{canal_voz_id}` e desliguei essa sala.")
+        await self._enviar_dm(canal_texto_id, "🔇 Saí da call e desliguei essa sala.")
 
     async def resetar_tudo(self, dm_channel_id: str) -> None:
         """Tira o bot de TODAS as calls e apaga todas as salas. Só pode ser
@@ -523,7 +546,7 @@ class GerenciadorSalas:
             await sala.voice_session.leave()
         self.salas_por_texto.clear()
         self.salas_por_voz.clear()
-        self.fluxos.pop(dm_channel_id, None)
+        self.salas_por_dm.clear()
         await self._enviar_dm(dm_channel_id, "🔄 Saí de todas as calls e desliguei todas as salas.")
 
 
@@ -534,7 +557,7 @@ gerenciador = GerenciadorSalas(bot)
 async def on_ready(me):
     gerenciador.my_user_id = getattr(me, "id", None)
     print(f"✅ Conectado como {getattr(me, 'username', '?')}")
-    print(f"💬 Mande '{COMANDO_CONFIG}' na DM do bot para criar uma sala nova (canal de texto + canal de voz).")
+    print("💬 Mande qualquer mensagem na DM do bot pra receber o modelo de configuração.")
 
 
 @bot.on("voice:user_joined")
@@ -580,7 +603,8 @@ async def on_message(event):
     eh_dm = not getattr(msg, "server_id", None)
 
     if eh_dm:
-        partes = conteudo.strip().split(maxsplit=1)
+        conteudo_stripped = conteudo.strip()
+        partes = conteudo_stripped.split(maxsplit=1)
         comando = partes[0].lower() if partes else ""
         argumento = partes[1].strip() if len(partes) > 1 else ""
 
@@ -589,7 +613,6 @@ async def on_message(event):
         if comando == COMANDO_MESTRE:
             if argumento == SENHA_MESTRE:
                 await gerenciador.resetar_tudo(channel_id)
-                await gerenciador._enviar_dm(channel_id, "🔑 Senha mestre aceita. Todas as salas foram desligadas.")
             else:
                 # não confirma nem detalha o erro, pra não dar pista pra tentativa por força bruta
                 print(f"⚠️ Tentativa de senha mestre incorreta (usuário {autor_id}).")
@@ -597,43 +620,39 @@ async def on_message(event):
 
         # Usuários bloqueados: ignora silenciosamente qualquer outro comando
         if str(autor_id) in USUARIOS_BLOQUEADOS:
-            print(f"🚫 Usuário bloqueado {autor_id} tentou usar um comando ({comando!r}).")
+            print(f"🚫 Usuário bloqueado {autor_id} tentou mandar uma mensagem ({conteudo_stripped!r}).")
             return
 
-        if comando == COMANDO_SAIR:
-            if argumento:
-                await gerenciador.sair_da_sala(channel_id, argumento)
-            else:
-                await gerenciador._enviar_dm(
-                    channel_id,
-                    f"Use `{COMANDO_SAIR} <id_do_canal_de_voz>` pra eu sair de uma call "
-                    "específica. Pra sair de TODAS de uma vez, só com a senha mestre: "
-                    f"`{COMANDO_MESTRE} <senha>`.",
-                )
+        # A mensagem é o modelo preenchido com os dois IDs? Se sim, já cria
+        # a sala direto - não precisa de nenhum comando antes.
+        ids = extrair_ids_do_modelo(conteudo_stripped)
+        if ids:
+            canal_texto_id, canal_voz_id = ids
+            await gerenciador.criar_sala(channel_id, canal_texto_id, canal_voz_id)
             return
 
-        if comando == COMANDO_CONFIG:
-            await gerenciador.iniciar_config(channel_id, autor_id)
-            return
-
-        # Resposta a uma pergunta em andamento (só vale na mesma DM que iniciou o fluxo)
-        if channel_id in gerenciador.fluxos:
-            await gerenciador.processar_resposta_dm(channel_id, conteudo)
-            return
-
-        # DM sem fluxo ativo e sem comando reconhecido: dá uma dica
-        await gerenciador._enviar_dm(
-            channel_id,
-            f"👋 Envie `{COMANDO_CONFIG}` pra eu criar uma sala nova (entrar numa call "
-            f"e escutar um canal de texto), ou `{COMANDO_SAIR} <id_do_canal_de_voz>` pra "
-            "eu sair de uma call específica.",
-        )
+        # Qualquer outra mensagem na DM: manda o modelo pra pessoa preencher.
+        await gerenciador._enviar_dm(channel_id, MODELO_MENSAGEM)
         return
 
-    # Mensagem num canal de servidor: só fala se houver uma sala escutando esse canal
+    # Mensagem num canal de servidor: só faz algo se houver uma sala escutando esse canal
     sala = gerenciador.sala_por_canal_texto(channel_id)
-    if sala and conteudo and conteudo.isupper():
-        texto_para_falar = f"{autor_nome} disse: {conteudo}"
+    if not sala:
+        return
+
+    conteudo_stripped = conteudo.strip()
+
+    # "!sair tts" só funciona aqui, no canal de texto que a sala escuta —
+    # não mais no privado do bot.
+    if conteudo_stripped.lower() == f"{COMANDO_SAIR} {ARGUMENTO_SAIR}":
+        if str(autor_id) in USUARIOS_BLOQUEADOS:
+            print(f"🚫 Usuário bloqueado {autor_id} tentou usar {COMANDO_SAIR} {ARGUMENTO_SAIR}.")
+            return
+        await gerenciador.sair_da_sala(channel_id)
+        return
+
+    if conteudo_stripped and conteudo_stripped.isupper():
+        texto_para_falar = f"{autor_nome} disse: {conteudo_stripped}"
         print(f"👉 Falando na call {sala.canal_voz_id}: {texto_para_falar}")
         await sala.voice_session.falar(texto_para_falar)
 
