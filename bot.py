@@ -43,6 +43,7 @@ from aiortc import (
     RTCSessionDescription,
     MediaStreamTrack,
 )
+from aiortc.contrib.media import MediaPlayer, MediaRelay
 from aiortc.sdp import candidate_from_sdp
 
 from nerimity_sdk import Bot
@@ -79,11 +80,6 @@ SAMPLE_RATE = 48000
 FRAME_MS = 20
 SAMPLES_PER_FRAME = SAMPLE_RATE * FRAME_MS // 1000  # 960 amostras por quadro
 
-# Limite de segurança: no máximo ~30s de áudio pendente por conexão.
-# Se uma conexão travar sem consumir a fila, ela para de crescer aqui
-# em vez de estourar a memória do computador.
-MAX_QUEUE_FRAMES = (30 * 1000) // FRAME_MS
-
 # Tempo máximo (segundos) que uma conexão pode ficar "connecting" antes
 # de ser considerada morta e fechada automaticamente.
 PEER_CONNECT_TIMEOUT = 20
@@ -107,37 +103,36 @@ ICE_SERVERS = [
 
 bot = Bot(token=TOKEN)
 
+# Um único MediaRelay compartilhado por todo o processo. Ele existe pra
+# resolver um problema específico: quando uma fala precisa ser ouvida por
+# vários participantes ao mesmo tempo, cada um tem seu próprio
+# RTCRtpSender/conexão, mas todos devem tocar o MESMO arquivo de fala.
+# Se a gente desse o track de um único MediaPlayer direto pra vários
+# senders, eles ficariam disputando (cada .recv() rouba um frame que o
+# outro sender precisava) e o áudio saía cortado pra todo mundo. O relay
+# resolve isso: cada sender recebe sua PRÓPRIA cópia (subscribe) do
+# mesmo áudio de origem, sem brigar por frame.
+_relay = MediaRelay()
 
-class TTSAudioTrack(MediaStreamTrack):
-    """Faixa de áudio "ao vivo" que fica emitindo silêncio até receber
-    PCM de fala pra tocar. Uma instância é criada por participante (cada
-    RTCPeerConnection precisa da sua própria, não dá pra reaproveitar a
-    mesma faixa em várias conexões)."""
+
+class SilenceAudioTrack(MediaStreamTrack):
+    """Faixa de áudio "de descanso": fica só emitindo silêncio, pra manter
+    a conexão WebRTC viva e com uma faixa válida enquanto ninguém está
+    falando. Uma instância é criada por participante (cada
+    RTCPeerConnection precisa da sua própria).
+
+    Quando o bot vai falar de verdade, a gente troca essa faixa pela do
+    MediaPlayer via `sender.replaceTrack(...)` (ver VoiceSession._falar_um),
+    e volta pra essa aqui quando a fala termina.
+    """
 
     kind = "audio"
 
     def __init__(self):
         super().__init__()
-        self._queue: "asyncio.Queue[bytes]" = asyncio.Queue()
         self._pts = 0
         self._start: Optional[float] = None
-
-    async def push_pcm(self, pcm_bytes: bytes) -> None:
-        frame_bytes = SAMPLES_PER_FRAME * 2  # 16 bits = 2 bytes/amostra
-        for i in range(0, len(pcm_bytes), frame_bytes):
-            # Trava de segurança: se a fila já está cheia (conexão travada,
-            # não está consumindo), descarta o áudio mais velho em vez de
-            # crescer sem limite e estourar a memória.
-            if self._queue.qsize() >= MAX_QUEUE_FRAMES:
-                try:
-                    self._queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    pass
-
-            chunk = pcm_bytes[i:i + frame_bytes]
-            if len(chunk) < frame_bytes:
-                chunk += b"\x00" * (frame_bytes - len(chunk))
-            await self._queue.put(chunk)
+        self._silencio = b"\x00" * (SAMPLES_PER_FRAME * 2)
 
     async def recv(self):
         if self._start is None:
@@ -145,16 +140,20 @@ class TTSAudioTrack(MediaStreamTrack):
 
         # mantém o ritmo de 20ms por quadro em tempo real
         target = self._start + (self._pts / SAMPLE_RATE)
-        delay = target - time.monotonic()
-        if delay > 0:
+        now = time.monotonic()
+        delay = target - now
+
+        # Se o event loop atrasou (outras conexões, sinalização etc.), não
+        # tenta "correr atrás" mandando frames em rajada — como é silêncio,
+        # só resincroniza o relógio suavemente. (Isso aqui já não afeta a
+        # fala em si, que agora usa MediaPlayer — ver mais abaixo.)
+        RESYNC_THRESHOLD = 0.08  # 80ms
+        if delay < -RESYNC_THRESHOLD:
+            self._start = now - (self._pts / SAMPLE_RATE)
+        elif delay > 0:
             await asyncio.sleep(delay)
 
-        try:
-            chunk = self._queue.get_nowait()
-        except asyncio.QueueEmpty:
-            chunk = b"\x00" * (SAMPLES_PER_FRAME * 2)  # silêncio
-
-        samples = np.frombuffer(chunk, dtype=np.int16).reshape(1, -1)
+        samples = np.frombuffer(self._silencio, dtype=np.int16).reshape(1, -1)
         frame = av.AudioFrame.from_ndarray(samples, format="s16", layout="mono")
         frame.sample_rate = SAMPLE_RATE
         frame.pts = self._pts
@@ -163,23 +162,18 @@ class TTSAudioTrack(MediaStreamTrack):
         return frame
 
 
-def decodificar_mp3_para_pcm(caminho: str) -> bytes:
-    """Decodifica o mp3 gerado pelo edge-tts para PCM 16-bit mono 48kHz.
-
-    Se o arquivo vier vazio/corrompido (ex.: falha de rede no edge-tts),
-    levanta a exceção de volta para quem chamou tratar — mas garante que
-    o container do PyAV/FFmpeg é sempre fechado, mesmo em erro, pra não
-    vazar memória/descritores de arquivo a cada falha.
-    """
+def _duracao_do_audio(caminho: str) -> float:
+    """Descobre a duração (em segundos) do mp3 sem decodificar o áudio
+    inteiro — só lê os metadados do container. Usado pra saber quanto
+    tempo esperar antes de voltar a faixa pro silêncio depois de uma fala."""
     container = av.open(caminho)
     try:
         stream = container.streams.audio[0]
-        resampler = av.AudioResampler(format="s16", layout="mono", rate=SAMPLE_RATE)
-        pcm = bytearray()
-        for frame in container.decode(stream):
-            for rframe in resampler.resample(frame):
-                pcm += bytes(rframe.planes[0])
-        return bytes(pcm)
+        if stream.duration is not None and stream.time_base is not None:
+            return float(stream.duration * stream.time_base)
+        if container.duration is not None:
+            return container.duration / av.time_base
+        return 0.0
     finally:
         container.close()
 
@@ -193,9 +187,16 @@ class VoiceSession:
         self.channel_id = channel_id
         self.my_user_id: Optional[str] = None
         self.peers: Dict[str, RTCPeerConnection] = {}
-        self.tracks: Dict[str, TTSAudioTrack] = {}
+        self.tracks: Dict[str, SilenceAudioTrack] = {}
         self._drain_tasks: Dict[str, list] = {}
         self._connected = False
+
+        # Fila de falas pendentes: cada `falar()` só empilha o texto aqui;
+        # quem realmente gera o TTS e toca é a `_processar_fila_de_fala`,
+        # uma de cada vez, na ordem — assim várias mensagens em CAIXA ALTA
+        # seguidas tocam em sequência, sem se sobrepor.
+        self._fila_de_fala: "asyncio.Queue[Tuple[str, str]]" = asyncio.Queue()
+        self._task_fala: Optional[asyncio.Task] = None
 
     # -- ciclo de vida --------------------------------------------------
 
@@ -207,9 +208,13 @@ class VoiceSession:
 
         await self.bot.rest.join_voice(self.channel_id, socket_id)
         self._connected = True
+        self._task_fala = asyncio.create_task(self._processar_fila_de_fala())
         print(f"🔊 Entrou no canal de voz {self.channel_id}")
 
     async def leave(self) -> None:
+        if self._task_fala:
+            self._task_fala.cancel()
+            self._task_fala = None
         for pc in list(self.peers.values()):
             await pc.close()
         for tasks in self._drain_tasks.values():
@@ -227,7 +232,7 @@ class VoiceSession:
 
     def _nova_conexao(self, user_id: str) -> RTCPeerConnection:
         pc = RTCPeerConnection(configuration=RTCConfiguration(iceServers=ICE_SERVERS))
-        track = TTSAudioTrack()
+        track = SilenceAudioTrack()
         pc.addTrack(track)
         self.peers[user_id] = pc
         self.tracks[user_id] = track
@@ -357,9 +362,28 @@ class VoiceSession:
     # -- fala ---------------------------------------------------------------
 
     async def falar(self, texto: str, voz: str = VOZ) -> None:
-        """Gera o TTS e transmite pra todo mundo conectado na call."""
+        """Enfileira o texto pra ser falado. Quem realmente gera o áudio e
+        toca é a `_processar_fila_de_fala`, então isso aqui só empilha e
+        volta na hora — não trava esperando o TTS terminar."""
+        await self._fila_de_fala.put((texto, voz))
+
+    async def _processar_fila_de_fala(self) -> None:
+        """Roda em background durante toda a vida da sessão: pega uma fala
+        da fila, toca até o fim (esperando o tempo dela), só então pega a
+        próxima. Isso garante que falas não se sobrepõem/misturam."""
+        while True:
+            texto, voz = await self._fila_de_fala.get()
+            try:
+                await self._falar_um(texto, voz)
+            except Exception as exc:
+                print(f"⚠️ Erro ao tocar fala, ignorando e seguindo pra próxima: {exc}")
+            finally:
+                self._fila_de_fala.task_done()
+
+    async def _falar_um(self, texto: str, voz: str) -> None:
         if not self.tracks:
             print("⚠️ Ninguém conectado na call ainda (ou negociação em andamento); nada pra ouvir.")
+            return
 
         out_file = f"tts_temp_{int(time.time() * 1000)}.mp3"
         try:
@@ -371,21 +395,48 @@ class VoiceSession:
                 return
 
             try:
-                # decodificar_mp3_para_pcm é bloqueante (I/O + CPU); rodar em
-                # thread separada evita travar o loop de eventos do bot
-                # (heartbeat, socket, outras mensagens) enquanto decodifica.
-                pcm = await asyncio.to_thread(decodificar_mp3_para_pcm, out_file)
+                duracao = await asyncio.to_thread(_duracao_do_audio, out_file)
             except Exception as exc:
-                # ex.: "packet queue is empty, aborting" - mp3 corrompido/
-                # incompleto. Não deixa o bot travar nem vazar: só ignora
-                # essa fala e segue funcionando.
-                print(f"⚠️ Falha ao decodificar áudio do TTS, ignorando essa fala: {exc}")
+                print(f"⚠️ mp3 do TTS corrompido/incompleto, ignorando essa fala: {exc}")
                 return
+
+            # MediaPlayer abre o arquivo e cuida da decodificação/pacing em
+            # cima do libav, numa thread própria — não compete com o loop
+            # de eventos do bot (sinalização WebRTC de outras conexões,
+            # heartbeat etc.) como a fila manual antiga competia. É isso
+            # que resolve o "pipocar": o ritmo dos frames deixa de depender
+            # de o loop asyncio estar livre no milissegundo certo.
+            player = MediaPlayer(out_file)
+            if player.audio is None:
+                print("⚠️ MediaPlayer não encontrou faixa de áudio no mp3, ignorando essa fala.")
+                return
+
+            # Troca a faixa de cada participante pela faixa da fala (cada um
+            # recebe sua PRÓPRIA cópia via relay, pra não brigarem por frame
+            # entre si). Guarda quem foi trocado pra saber quem reverter
+            # pro silêncio depois.
+            trocados: list = []
+            for user_id, pc in list(self.peers.items()):
+                for sender in pc.getSenders():
+                    if sender.track is not None and sender.track.kind == "audio":
+                        relayed = _relay.subscribe(player.audio)
+                        sender.replaceTrack(relayed)
+                        trocados.append((user_id, sender))
+                        break
+
+            try:
+                # espera a duração real da fala (+ uma folga) antes de
+                # voltar pro silêncio, senão cortaria o áudio no meio.
+                await asyncio.sleep(duracao + 0.3)
+            finally:
+                for user_id, sender in trocados:
+                    silencio = self.tracks.get(user_id)
+                    if silencio is not None:
+                        sender.replaceTrack(silencio)
+                player.audio.stop()
         finally:
             if os.path.exists(out_file):
                 os.remove(out_file)
-
-        await asyncio.gather(*(track.push_pcm(pcm) for track in self.tracks.values()))
 
 
 class Sala:
