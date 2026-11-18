@@ -1,43 +1,19 @@
 """
-Bot de TTS para Nerimity que ENTRA NA CALL DE VOZ e fala o texto do chat.
-
-⚠️ AVISO IMPORTANTE
-A Nerimity não expõe uma API pronta de "bot entra na call e manda áudio".
-As chamadas de voz funcionam com WebRTC em malha (mesh): cada participante
-troca sinalização (ofertas/respostas SDP e candidatos ICE) via Socket.IO
-usando os eventos "voice:signal_send" / "voice:signal_received", tudo isso
-espelhando o que o cliente web oficial (simple-peer) faz. Não existe
-documentação pública desse protocolo — o que está aqui foi construído
-inspecionando o pacote nerimity_sdk (nerimity_sdk/transport/rest.py e
-gateway.py) e o código-fonte do cliente oficial em
-https://github.com/Nerimity/nerimity-web (src/chat-api/store/useVoiceUsers.ts
-e src/chat-api/emits/voiceEmits.ts).
-
-Ou seja: isso é uma implementação "melhor esforço" baseada em engenharia
-reversa. Se a Nerimity mudar o protocolo de sinalização no futuro, este
-código pode parar de funcionar e precisar de ajustes.
-
-DEPENDÊNCIAS (além do que você já tinha):
-    pip install aiortc av numpy edge-tts nerimity_sdk
-
-Não precisa mais do pygame — o áudio agora vai direto para a chamada de voz,
-em vez de tocar no alto-falante do computador que roda o bot.
+Bot de TTS para Nerimity com áudio estabilizado (sem picotar), comando -tts,
+aviso de CAPSLOCK com autodeleção em 1 minuto e leitura estrita em maiúsculas.
 """
 
 import asyncio
 import fractions
 import os
-import re
 import time
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Set
 
 import av
-import numpy as np
 import edge_tts
-
+import numpy as np
 from aiortc import (
     RTCConfiguration,
-    RTCIceCandidate,
     RTCIceServer,
     RTCPeerConnection,
     RTCSessionDescription,
@@ -48,48 +24,20 @@ from aiortc.sdp import candidate_from_sdp
 from nerimity_sdk import Bot
 
 # --- CONFIGURAÇÕES ---
-TOKEN = "XXXXX"
-VOZ = "pt-BR-AntonioNeural"  # Voz masculina padrão
+TOKEN = "TOKEN"
+VOZ = "pt-BR-AntonioNeural"
 
-# Comando pra sair da call. Uso: "!sair tts" (a palavra "tts" é fixa —
-# tira o bot da sala que essa conversa (DM) criou, sem precisar saber o
-# ID do canal de voz de cor).
-COMANDO_SAIR = "!sair"
-ARGUMENTO_SAIR = "tts"
-
-# --- CONTROLE DE ACESSO ---
-# IDs de usuários que NUNCA podem usar os comandos do bot.
-# Adicione manualmente os IDs aqui, como texto, um por linha.
-USUARIOS_BLOQUEADOS = {
-    # "123456789012345678",
-    # "987654321098765432",
+USUARIOS_BLOQUEADOS: Set[str] = {
+    # "ID_USUARIO_BLOQUEADO",
 }
-
-# Comando de senha mestre: SEMPRE reseta TODAS as salas de uma vez (tira o
-# bot de todas as calls), não importa quem manda - inclusive gente bloqueada
-# - porque a autenticação aqui é pela senha, não pelo ID de quem enviou.
-# É a ÚNICA forma de resetar tudo de uma vez; "!sair tts" só tira a sala
-# criada por aquela conversa específica. Troque o valor abaixo antes de
-# rodar o bot; use algo só seu.
-# Uso: mande "!master SUA_SENHA_AQUI" na DM do bot.
-COMANDO_MESTRE = "!master"
-SENHA_MESTRE = "TROQUE_ESSA_SENHA"
 
 SAMPLE_RATE = 48000
 FRAME_MS = 20
 SAMPLES_PER_FRAME = SAMPLE_RATE * FRAME_MS // 1000  # 960 amostras por quadro
 
-# Limite de segurança: no máximo ~30s de áudio pendente por conexão.
-# Se uma conexão travar sem consumir a fila, ela para de crescer aqui
-# em vez de estourar a memória do computador.
-MAX_QUEUE_FRAMES = (30 * 1000) // FRAME_MS
-
-# Tempo máximo (segundos) que uma conexão pode ficar "connecting" antes
-# de ser considerada morta e fechada automaticamente.
+MAX_QUEUE_FRAMES = 100
 PEER_CONNECT_TIMEOUT = 20
 
-# Servidores STUN/TURN usados pelo cliente oficial da Nerimity
-# (retirados do código-fonte público de nerimity-web, useVoiceUsers.ts)
 ICE_SERVERS = [
     RTCIceServer(urls="stun:stun.l.google.com:19302"),
     RTCIceServer(urls="stun:stun.relay.metered.ca:80"),
@@ -109,11 +57,6 @@ bot = Bot(token=TOKEN)
 
 
 class TTSAudioTrack(MediaStreamTrack):
-    """Faixa de áudio "ao vivo" que fica emitindo silêncio até receber
-    PCM de fala pra tocar. Uma instância é criada por participante (cada
-    RTCPeerConnection precisa da sua própria, não dá pra reaproveitar a
-    mesma faixa em várias conexões)."""
-
     kind = "audio"
 
     def __init__(self):
@@ -123,18 +66,15 @@ class TTSAudioTrack(MediaStreamTrack):
         self._start: Optional[float] = None
 
     async def push_pcm(self, pcm_bytes: bytes) -> None:
-        frame_bytes = SAMPLES_PER_FRAME * 2  # 16 bits = 2 bytes/amostra
+        frame_bytes = SAMPLES_PER_FRAME * 2
         for i in range(0, len(pcm_bytes), frame_bytes):
-            # Trava de segurança: se a fila já está cheia (conexão travada,
-            # não está consumindo), descarta o áudio mais velho em vez de
-            # crescer sem limite e estourar a memória.
             if self._queue.qsize() >= MAX_QUEUE_FRAMES:
                 try:
                     self._queue.get_nowait()
                 except asyncio.QueueEmpty:
                     pass
 
-            chunk = pcm_bytes[i:i + frame_bytes]
+            chunk = pcm_bytes[i : i + frame_bytes]
             if len(chunk) < frame_bytes:
                 chunk += b"\x00" * (frame_bytes - len(chunk))
             await self._queue.put(chunk)
@@ -143,7 +83,6 @@ class TTSAudioTrack(MediaStreamTrack):
         if self._start is None:
             self._start = time.monotonic()
 
-        # mantém o ritmo de 20ms por quadro em tempo real
         target = self._start + (self._pts / SAMPLE_RATE)
         delay = target - time.monotonic()
         if delay > 0:
@@ -152,9 +91,13 @@ class TTSAudioTrack(MediaStreamTrack):
         try:
             chunk = self._queue.get_nowait()
         except asyncio.QueueEmpty:
-            chunk = b"\x00" * (SAMPLES_PER_FRAME * 2)  # silêncio
+            chunk = b"\x00" * (SAMPLES_PER_FRAME * 2)
 
-        samples = np.frombuffer(chunk, dtype=np.int16).reshape(1, -1)
+        # Garante conversão e normalização exata para evitar estouro/chiado no WebRTC
+        samples = np.frombuffer(chunk, dtype=np.int16).copy()
+        # Limita o volume para evitar pico de áudio estourado
+        samples = np.clip(samples, -32768, 32767).reshape(1, -1)
+
         frame = av.AudioFrame.from_ndarray(samples, format="s16", layout="mono")
         frame.sample_rate = SAMPLE_RATE
         frame.pts = self._pts
@@ -164,17 +107,16 @@ class TTSAudioTrack(MediaStreamTrack):
 
 
 def decodificar_mp3_para_pcm(caminho: str) -> bytes:
-    """Decodifica o mp3 gerado pelo edge-tts para PCM 16-bit mono 48kHz.
-
-    Se o arquivo vier vazio/corrompido (ex.: falha de rede no edge-tts),
-    levanta a exceção de volta para quem chamou tratar — mas garante que
-    o container do PyAV/FFmpeg é sempre fechado, mesmo em erro, pra não
-    vazar memória/descritores de arquivo a cada falha.
-    """
+    """Decodifica e reamostra o MP3 para PCM mono 48kHz limpo."""
     container = av.open(caminho)
     try:
         stream = container.streams.audio[0]
-        resampler = av.AudioResampler(format="s16", layout="mono", rate=SAMPLE_RATE)
+        resampler = av.AudioResampler(
+            format="s16", 
+            layout="mono", 
+            rate=SAMPLE_RATE,
+            frame_size=SAMPLES_PER_FRAME
+        )
         pcm = bytearray()
         for frame in container.decode(stream):
             for rframe in resampler.resample(frame):
@@ -185,11 +127,8 @@ def decodificar_mp3_para_pcm(caminho: str) -> bytes:
 
 
 class VoiceSession:
-    """Gerencia a presença do bot em UM canal de voz: entra, negocia WebRTC
-    com cada participante (malha peer-to-peer) e distribui o áudio falado."""
-
-    def __init__(self, bot: Bot, channel_id: str):
-        self.bot = bot
+    def __init__(self, bot_inst: Bot, channel_id: str):
+        self.bot = bot_inst
         self.channel_id = channel_id
         self.my_user_id: Optional[str] = None
         self.peers: Dict[str, RTCPeerConnection] = {}
@@ -197,13 +136,11 @@ class VoiceSession:
         self._drain_tasks: Dict[str, list] = {}
         self._connected = False
 
-    # -- ciclo de vida --------------------------------------------------
-
     async def join(self) -> None:
-        gateway = self.bot._gateway  # acesso "por baixo dos panos" do SDK
-        socket_id = gateway.socket_id
+        gateway = self.bot._gateway
+        socket_id = getattr(gateway, "socket_id", None)
         if not socket_id:
-            raise RuntimeError("Gateway ainda não conectado; entre na voz depois do evento 'ready'.")
+            raise RuntimeError("Gateway ainda não conectado.")
 
         await self.bot.rest.join_voice(self.channel_id, socket_id)
         self._connected = True
@@ -223,8 +160,6 @@ class VoiceSession:
             self._connected = False
         print("🔇 Saiu do canal de voz")
 
-    # -- WebRTC -----------------------------------------------------------
-
     def _nova_conexao(self, user_id: str) -> RTCPeerConnection:
         pc = RTCPeerConnection(configuration=RTCConfiguration(iceServers=ICE_SERVERS))
         track = TTSAudioTrack()
@@ -235,28 +170,15 @@ class VoiceSession:
 
         @pc.on("connectionstatechange")
         async def on_state_change():
-            print(f"[RTC] {user_id}: {pc.connectionState}")
             if pc.connectionState in ("failed", "closed", "disconnected"):
                 await self._remover_conexao(user_id)
 
         @pc.on("track")
         def on_track(remote_track):
-            # IMPORTANTE: o aiortc guarda o áudio recebido de cada participante
-            # numa fila SEM LIMITE (RemoteStreamTrack._queue). Se ninguém
-            # nunca chama .recv() nela, essa fila cresce pra sempre enquanto
-            # a pessoa fica na call - é a maior causa de vazamento de memória
-            # aqui. Como o bot só precisa FALAR (não escutar), a gente
-            # consome e descarta esse áudio continuamente pra fila nunca
-            # acumular.
-            print(f"[RTC] {user_id}: recebendo faixa '{remote_track.kind}', descartando (bot não escuta).")
             drain_task = asyncio.create_task(self._descartar_audio_recebido(user_id, remote_track))
             self._drain_tasks[user_id].append(drain_task)
 
-        # Watchdog: se essa conexão nunca sair de "connecting"/"new" dentro
-        # do prazo, ela é considerada travada (zumbi) e é fechada sozinha —
-        # evita que fiquem se acumulando pra sempre em memória.
         asyncio.create_task(self._watchdog_conexao(user_id, pc))
-
         return pc
 
     async def _descartar_audio_recebido(self, user_id: str, remote_track) -> None:
@@ -264,13 +186,11 @@ class VoiceSession:
             while True:
                 await remote_track.recv()
         except Exception:
-            # a faixa terminou (usuário saiu, mudou de mic, conexão fechou etc.)
             pass
 
     async def _watchdog_conexao(self, user_id: str, pc: RTCPeerConnection) -> None:
         await asyncio.sleep(PEER_CONNECT_TIMEOUT)
         if self.peers.get(user_id) is pc and pc.connectionState not in ("connected",):
-            print(f"[RTC] {user_id}: conexão travada em '{pc.connectionState}', fechando.")
             await self._remover_conexao(user_id)
 
     async def _remover_conexao(self, user_id: str) -> None:
@@ -282,19 +202,17 @@ class VoiceSession:
             await pc.close()
 
     async def _enviar_sinal(self, to_user_id: str, signal: dict) -> None:
-        await self.bot._gateway.emit(
-            "voice:signal_send",
-            {
-                "channelId": self.channel_id,
-                "toUserId": to_user_id,
-                "signal": signal,
-            },
-        )
+        if hasattr(self.bot, "_gateway") and self.bot._gateway:
+            await self.bot._gateway.emit(
+                "voice:signal_send",
+                {
+                    "channelId": self.channel_id,
+                    "toUserId": to_user_id,
+                    "signal": signal,
+                },
+            )
 
     async def ao_usuario_entrar(self, payload: dict) -> None:
-        """Alguém entrou no canal enquanto o bot já estava lá -> o bot inicia
-        a oferta (mesma lógica do cliente oficial: quem já está na call
-        inicia a conexão com quem chega)."""
         if not self._connected:
             return
         channel_id = payload.get("channelId")
@@ -342,7 +260,7 @@ class VoiceSession:
 
         elif signal.get("candidate"):
             if pc is None:
-                return  # candidato chegou antes da oferta/resposta; ignora
+                return
             cand_info = signal["candidate"]
             cand_str = cand_info.get("candidate", "")
             if cand_str.startswith("candidate:"):
@@ -354,200 +272,34 @@ class VoiceSession:
             candidate.sdpMLineIndex = cand_info.get("sdpMLineIndex")
             await pc.addIceCandidate(candidate)
 
-    # -- fala ---------------------------------------------------------------
-
     async def falar(self, texto: str, voz: str = VOZ) -> None:
-        """Gera o TTS e transmite pra todo mundo conectado na call."""
-        if not self.tracks:
-            print("⚠️ Ninguém conectado na call ainda (ou negociação em andamento); nada pra ouvir.")
-
         out_file = f"tts_temp_{int(time.time() * 1000)}.mp3"
         try:
             communicate = edge_tts.Communicate(texto, voz)
             await communicate.save(out_file)
 
             if not os.path.exists(out_file) or os.path.getsize(out_file) == 0:
-                print("⚠️ edge-tts gerou um arquivo vazio (provável falha de rede); ignorando essa fala.")
                 return
 
             try:
-                # decodificar_mp3_para_pcm é bloqueante (I/O + CPU); rodar em
-                # thread separada evita travar o loop de eventos do bot
-                # (heartbeat, socket, outras mensagens) enquanto decodifica.
                 pcm = await asyncio.to_thread(decodificar_mp3_para_pcm, out_file)
             except Exception as exc:
-                # ex.: "packet queue is empty, aborting" - mp3 corrompido/
-                # incompleto. Não deixa o bot travar nem vazar: só ignora
-                # essa fala e segue funcionando.
-                print(f"⚠️ Falha ao decodificar áudio do TTS, ignorando essa fala: {exc}")
+                print(f"⚠️ Erro ao decodificar TTS: {exc}")
                 return
         finally:
             if os.path.exists(out_file):
                 os.remove(out_file)
 
-        await asyncio.gather(*(track.push_pcm(pcm) for track in self.tracks.values()))
-
-
-class Sala:
-    """Uma sala = um par (canal de texto que o bot escuta) + (canal de voz
-    onde ele fala). O bot pode ter várias salas ativas ao mesmo tempo, cada
-    uma com sua própria VoiceSession — inclusive em servidores diferentes."""
-
-    def __init__(self, canal_texto_id: str, canal_voz_id: str, voice_session: "VoiceSession"):
-        self.canal_texto_id = canal_texto_id
-        self.canal_voz_id = canal_voz_id
-        self.voice_session = voice_session
-
-
-# --- MODELO QUE A PESSOA PREENCHE NO PRIVADO -------------------------------
-# Em vez de um fluxo de pergunta-resposta (!config -> pergunta canal de
-# texto -> espera resposta -> pergunta canal de voz -> espera resposta),
-# o bot manda um modelo pronto. A pessoa copia, preenche os dois IDs e
-# manda de volta numa única mensagem; o bot lê e já entra na call.
-_LABEL_TEXTO = "ID do canal de texto"
-_LABEL_VOZ = "ID do canal de voz"
-
-MODELO_MENSAGEM = (
-    "👋 Pra eu entrar numa call, copia o texto abaixo, preenche os dois IDs "
-    "(um em cada linha, depois dos dois-pontos) e manda de volta pra mim "
-    "numa única mensagem:\n\n"
-    "```\n"
-    f"{_LABEL_TEXTO}: \n"
-    f"{_LABEL_VOZ}: \n"
-    "```\n\n"
-    f"Pra eu sair da call depois, manda `{COMANDO_SAIR} {ARGUMENTO_SAIR}` "
-    "no canal de TEXTO que você definiu (não aqui no privado)."
-)
-
-_PADRAO_TEXTO = re.compile(rf"(?im)^\s*{re.escape(_LABEL_TEXTO)}\s*:\s*(\S+)\s*$")
-_PADRAO_VOZ = re.compile(rf"(?im)^\s*{re.escape(_LABEL_VOZ)}\s*:\s*(\S+)\s*$")
-
-
-def extrair_ids_do_modelo(texto: str) -> Optional[Tuple[str, str]]:
-    """Tenta ler uma mensagem no formato do MODELO_MENSAGEM (as duas linhas
-    'ID do canal de texto: ...' e 'ID do canal de voz: ...') e devolve
-    (id_texto, id_voz) se as duas vierem preenchidas. Devolve None se a
-    mensagem não bater com esse formato (então não é uma resposta ao
-    modelo, é só uma mensagem qualquer)."""
-    m_texto = _PADRAO_TEXTO.search(texto or "")
-    m_voz = _PADRAO_VOZ.search(texto or "")
-    if m_texto and m_voz:
-        return m_texto.group(1).strip(), m_voz.group(1).strip()
-    return None
+        if self.tracks:
+            await asyncio.gather(*(track.push_pcm(pcm) for track in self.tracks.values()))
 
 
 class GerenciadorSalas:
-    """Gerencia todas as salas (calls) ativas do bot.
-
-    No PRIVADO do bot (por qualquer pessoa):
-      <qualquer mensagem que não seja o modelo preenchido> -> manda o
-                                                                modelo pra
-                                                                preencher
-      <modelo preenchido com os dois IDs>                   -> já entra na
-                                                                call
-      !master <senha>                                        -> reseta
-                                                                TODAS as
-                                                                salas
-
-    No canal de TEXTO que a sala está escutando (não no privado):
-      !sair tts -> tira o bot da call e desliga aquela sala
-    """
-
-    def __init__(self, bot: Bot):
-        self.bot = bot
+    def __init__(self, bot_inst: Bot):
+        self.bot = bot_inst
         self.my_user_id: Optional[str] = None
-        self.salas_por_texto: Dict[str, Sala] = {}   # canal_texto_id -> Sala
-        self.salas_por_voz: Dict[str, Sala] = {}      # canal_voz_id  -> Sala
-        self.salas_por_dm: Dict[str, Sala] = {}       # dm_channel_id -> Sala (quem criou)
-
-    async def _enviar_dm(self, channel_id: str, texto: str) -> None:
-        if channel_id:
-            await self.bot.rest.create_message(channel_id, texto)
-
-    def sala_por_canal_texto(self, canal_texto_id: str) -> Optional[Sala]:
-        return self.salas_por_texto.get(canal_texto_id)
-
-    def sala_por_canal_voz(self, canal_voz_id: str) -> Optional[Sala]:
-        return self.salas_por_voz.get(canal_voz_id)
-
-    # -- criar sala a partir do modelo preenchido ----------------------------
-
-    async def criar_sala(self, dm_channel_id: str, canal_texto_id: str, canal_voz_id: str) -> None:
-        if dm_channel_id in self.salas_por_dm:
-            await self._enviar_dm(
-                dm_channel_id,
-                "⚠️ Você já tem uma sala ativa criada por aqui. Vá até o canal de texto "
-                f"dela e manda `{COMANDO_SAIR} {ARGUMENTO_SAIR}` antes de criar outra.",
-            )
-            return
-
-        if canal_texto_id in self.salas_por_texto:
-            await self._enviar_dm(
-                dm_channel_id,
-                "⚠️ Esse canal de texto já está sendo escutado por outra sala. "
-                "Preenche o modelo com outro ID de canal de texto.",
-            )
-            return
-
-        if canal_voz_id in self.salas_por_voz:
-            await self._enviar_dm(
-                dm_channel_id,
-                "⚠️ Já estou nesse canal de voz em outra sala. Preenche o modelo "
-                "com outro ID de canal de voz.",
-            )
-            return
-
-        voice_session = VoiceSession(self.bot, canal_voz_id)
-        voice_session.my_user_id = self.my_user_id
-        try:
-            await voice_session.join()
-        except Exception as exc:
-            print(f"❌ Não consegui entrar na call: {exc}")
-            await self._enviar_dm(
-                dm_channel_id,
-                f"❌ Não consegui entrar nesse canal de voz ({exc}). Confere os IDs "
-                "e manda o modelo preenchido de novo.",
-            )
-            return
-
-        sala = Sala(canal_texto_id, canal_voz_id, voice_session)
-        self.salas_por_texto[canal_texto_id] = sala
-        self.salas_por_voz[canal_voz_id] = sala
-        self.salas_por_dm[dm_channel_id] = sala
-
-        await self._enviar_dm(
-            dm_channel_id,
-            "🎉 Tudo pronto! Já entrei nessa call e vou falar as mensagens em "
-            "CAIXA ALTA daquele canal.\n\n"
-            f"Pra eu sair, manda `{COMANDO_SAIR} {ARGUMENTO_SAIR}` lá no canal "
-            "de texto (não aqui no privado).",
-        )
-
-    # -- sair da call ---------------------------------------------------------
-
-    async def sair_da_sala(self, canal_texto_id: str) -> None:
-        """Tira o bot da call escutada por esse canal de texto. Precisa ser
-        chamado com o ID do canal de texto onde o comando foi mandado —
-        é assim que o bot sabe qual sala desligar."""
-        sala = self.salas_por_texto.pop(canal_texto_id, None)
-        if not sala:
-            return  # nenhuma sala ativa nesse canal; nada a fazer
-        self.salas_por_voz.pop(sala.canal_voz_id, None)
-        for dm_channel_id, s in list(self.salas_por_dm.items()):
-            if s is sala:
-                del self.salas_por_dm[dm_channel_id]
-        await sala.voice_session.leave()
-        await self._enviar_dm(canal_texto_id, "🔇 Saí da call e desliguei essa sala.")
-
-    async def resetar_tudo(self, dm_channel_id: str) -> None:
-        """Tira o bot de TODAS as calls e apaga todas as salas. Só pode ser
-        chamado através do comando de senha mestre."""
-        for sala in list(self.salas_por_voz.values()):
-            await sala.voice_session.leave()
-        self.salas_por_texto.clear()
-        self.salas_por_voz.clear()
-        self.salas_por_dm.clear()
-        await self._enviar_dm(dm_channel_id, "🔄 Saí de todas as calls e desliguei todas as salas.")
+        self.salas_por_texto: Dict[str, str] = {}
+        self.sessions: Dict[str, VoiceSession] = {}
 
 
 gerenciador = GerenciadorSalas(bot)
@@ -557,106 +309,107 @@ gerenciador = GerenciadorSalas(bot)
 async def on_ready(me):
     gerenciador.my_user_id = getattr(me, "id", None)
     print(f"✅ Conectado como {getattr(me, 'username', '?')}")
-    print("💬 Mande qualquer mensagem na DM do bot pra receber o modelo de configuração.")
 
 
 @bot.on("voice:user_joined")
 async def on_voice_user_joined(payload):
-    sala = gerenciador.sala_por_canal_voz(str(payload.get("channelId", "")))
+    sala = gerenciador.sessions.get(str(payload.get("channelId", "")))
     if sala:
-        await sala.voice_session.ao_usuario_entrar(payload)
+        await sala.ao_usuario_entrar(payload)
 
 
 @bot.on("voice:user_left")
 async def on_voice_user_left(payload):
-    sala = gerenciador.sala_por_canal_voz(str(payload.get("channelId", "")))
+    sala = gerenciador.sessions.get(str(payload.get("channelId", "")))
     if sala:
-        await sala.voice_session.ao_usuario_sair(payload)
+        await sala.ao_usuario_sair(payload)
 
 
 @bot.on("voice:signal_received")
 async def on_voice_signal(payload):
-    sala = gerenciador.sala_por_canal_voz(str(payload.get("channelId", "")))
+    sala = gerenciador.sessions.get(str(payload.get("channelId", "")))
     if sala:
-        await sala.voice_session.ao_receber_sinal(payload)
+        await sala.ao_receber_sinal(payload)
 
 
 @bot.on("message:created")
 async def on_message(event):
-    """Roda a cada mensagem nova no chat (servidor ou DM)."""
     msg = event.message
     channel_id = str(msg.channel_id)
     conteudo = getattr(msg, "content", "") or ""
 
-    autor_id = None
-    autor_nome = "Alguém"
-    if hasattr(msg, "created_by") and msg.created_by:
-        autor_id = getattr(msg.created_by, "id", None)
-        autor_nome = getattr(msg.created_by, "username", "Alguém")
+    autor = getattr(msg, "created_by", None)
+    autor_id = getattr(autor, "id", None)
+    autor_nome = getattr(autor, "username", "Alguém")
 
-    # evita que o bot reaja às próprias mensagens (loop infinito)
     if gerenciador.my_user_id and str(autor_id) == str(gerenciador.my_user_id):
         return
 
-    # Mensagens diretas (DM) não têm server_id - é assim que diferenciamos
-    # de mensagens mandadas num canal de servidor.
-    eh_dm = not getattr(msg, "server_id", None)
-
-    if eh_dm:
-        conteudo_stripped = conteudo.strip()
-        partes = conteudo_stripped.split(maxsplit=1)
-        comando = partes[0].lower() if partes else ""
-        argumento = partes[1].strip() if len(partes) > 1 else ""
-
-        # Senha mestre: funciona pra qualquer um, inclusive gente bloqueada,
-        # porque a autenticação é pela senha, não pelo ID de quem manda.
-        if comando == COMANDO_MESTRE:
-            if argumento == SENHA_MESTRE:
-                await gerenciador.resetar_tudo(channel_id)
-            else:
-                # não confirma nem detalha o erro, pra não dar pista pra tentativa por força bruta
-                print(f"⚠️ Tentativa de senha mestre incorreta (usuário {autor_id}).")
-            return
-
-        # Usuários bloqueados: ignora silenciosamente qualquer outro comando
-        if str(autor_id) in USUARIOS_BLOQUEADOS:
-            print(f"🚫 Usuário bloqueado {autor_id} tentou mandar uma mensagem ({conteudo_stripped!r}).")
-            return
-
-        # A mensagem é o modelo preenchido com os dois IDs? Se sim, já cria
-        # a sala direto - não precisa de nenhum comando antes.
-        ids = extrair_ids_do_modelo(conteudo_stripped)
-        if ids:
-            canal_texto_id, canal_voz_id = ids
-            await gerenciador.criar_sala(channel_id, canal_texto_id, canal_voz_id)
-            return
-
-        # Qualquer outra mensagem na DM: manda o modelo pra pessoa preencher.
-        await gerenciador._enviar_dm(channel_id, MODELO_MENSAGEM)
-        return
-
-    # Mensagem num canal de servidor: só faz algo se houver uma sala escutando esse canal
-    sala = gerenciador.sala_por_canal_texto(channel_id)
-    if not sala:
+    if autor_id and str(autor_id) in USUARIOS_BLOQUEADOS:
         return
 
     conteudo_stripped = conteudo.strip()
+    partes = conteudo_stripped.split(maxsplit=1)
+    comando = partes[0].lower() if partes else ""
+    argumento = partes[1].strip() if len(partes) > 1 else ""
 
-    # "!sair tts" só funciona aqui, no canal de texto que a sala escuta —
-    # não mais no privado do bot.
-    if conteudo_stripped.lower() == f"{COMANDO_SAIR} {ARGUMENTO_SAIR}":
-        if str(autor_id) in USUARIOS_BLOQUEADOS:
-            print(f"🚫 Usuário bloqueado {autor_id} tentou usar {COMANDO_SAIR} {ARGUMENTO_SAIR}.")
+    # Comando unificado -tts (entra ou sai da call)
+    if comando == "-tts":
+        if channel_id in gerenciador.salas_por_texto:
+            canal_voz_id = gerenciador.salas_por_texto.pop(channel_id, None)
+            session = gerenciador.sessions.pop(canal_voz_id, None)
+            if session:
+                await session.leave()
+            await bot.rest.create_message(channel_id, "🔇 Bot desconectado da call.")
             return
-        await gerenciador.sair_da_sala(channel_id)
+
+        canal_voz_alvo = argumento if argumento else channel_id
+
+        voice_session = VoiceSession(bot, canal_voz_alvo)
+        voice_session.my_user_id = gerenciador.my_user_id
+        try:
+            await voice_session.join()
+        except Exception as exc:
+            await bot.rest.create_message(channel_id, f"❌ Erro ao entrar na call: {exc}")
+            return
+
+        gerenciador.salas_por_texto[channel_id] = canal_voz_alvo
+        gerenciador.sessions[canal_voz_alvo] = voice_session
+        
+        # Mensagem atualizada informando que o bot só lê CAPSLOCK + aviso de sincronização
+        mensagem_aviso = await bot.rest.create_message(
+            channel_id, 
+            "💡 **Aviso:** Eu só leio mensagens em **CAPSLOCK** (caixa alta)!\n"
+            "Caso não esteja me escutando ou com o ícone de microfone silenciado, saia e entre novamente da ligação."
+        )
+
+        # Deleta o aviso automaticamente após 1 minuto (60 segundos)
+        async def apagar_aviso_depois_de_um_minuto():
+            await asyncio.sleep(60)
+            try:
+                msg_id = getattr(mensagem_aviso, "id", None)
+                if msg_id:
+                    await bot.rest.delete_message(channel_id, msg_id)
+            except Exception:
+                pass
+
+        asyncio.create_task(apagar_aviso_depois_de_um_minuto())
         return
 
-    if conteudo_stripped and conteudo_stripped.isupper():
-        texto_para_falar = f"{autor_nome} disse: {conteudo_stripped}"
-        print(f"👉 Falando na call {sala.canal_voz_id}: {texto_para_falar}")
-        await sala.voice_session.falar(texto_para_falar)
+    # Leitura de mensagens para o TTS (Estritamente CAPSLOCK)
+    canal_voz_id = gerenciador.salas_por_texto.get(channel_id)
+    if canal_voz_id and conteudo_stripped:
+        tem_letras = any(c.isalpha() for c in conteudo_stripped)
+        if not tem_letras or not conteudo_stripped.isupper():
+            return
+
+        session = gerenciador.sessions.get(canal_voz_id)
+        if session:
+            texto_para_falar = f"{autor_nome} disse: {conteudo_stripped}"
+            print(f"👉 Falando na call: {texto_para_falar}")
+            await session.falar(texto_para_falar)
 
 
 if __name__ == "__main__":
-    print("🔄 Iniciando o Bot com o SDK oficial...")
+    print("🔄 Iniciando o Bot (Áudio normalizado + Aviso de CAPSLOCK)...")
     bot.run()
