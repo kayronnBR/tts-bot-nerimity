@@ -1,267 +1,186 @@
+# TTS Bot PT-BR para Nerimity
 
-# 🤖 Nerimity TTS Voice Bot
+Bot de texto-a-fala para Nerimity, feito para rodar no **Termux (Android)**.
+Ele entra na chamada de voz, lê mensagens em **CAPSLOCK** e fala o nome da
+pessoa na primeira mensagem (e quando a pessoa muda).
 
-Bot para o [Nerimity](https://nerimity.com) que **entra automaticamente em um canal de voz** e **fala em voz alta** (usando TTS da Microsoft/Edge) qualquer mensagem escrita **EM CAPS LOCK** em um canal de texto.
+## Funcionalidades
 
-O áudio é transmitido **de verdade para dentro da chamada de voz** via WebRTC (não é só tocar um som no computador que roda o bot) — outras pessoas na call ouvem o bot falando.
+- Comando `-tts` entra/sai da call de voz.
+- Lê **somente mensagens em caixa alta** (ex.: `OLA MARILENE`).
+- Fala `nome disse: mensagem` na primeira vez; mensagens seguintes do mesmo
+  usuário são faladas sem o nome.
+- Áudio sem cortes: usa relógio absoluto de 20 ms por frame e buffer de 10 s.
+- Conecta automaticamente com quem já estava na call (não precisa sair/entrar).
+- Cache de áudio (até 50 falas) para repetir frases instantaneamente.
+- Reinicia sozinho se cair (loop no tmux + watchdog).
 
----
+## Requisitos
 
-## ⚠️ Aviso importante
+### No celular (Termux)
 
-A Nerimity não possui uma API oficial e documentada para "bot entra na call e manda áudio". As chamadas de voz funcionam com **WebRTC em malha (mesh)**, sinalizado por Socket.IO. Este bot foi construído fazendo engenharia reversa do `nerimity_sdk` e do [cliente web oficial da Nerimity](https://github.com/Nerimity/nerimity-web) para replicar esse comportamento.
-
-Ou seja: funciona hoje, mas **não é um recurso oficialmente suportado**. Se a Nerimity mudar o protocolo de sinalização no futuro, pode ser necessário ajustar o código.
-
----
-
-## ✨ Funcionalidades
-
-- Conecta ao Nerimity usando o [`nerimity_sdk`](https://pypi.org/project/nerimity_sdk/) oficial.
-- Entra automaticamente em um canal de voz configurado.
-- Escuta um canal de texto e detecta mensagens 100% em **CAIXA ALTA**.
-- Gera a fala com [`edge-tts`](https://github.com/rany2/edge-tts) (voz neural da Microsoft, gratuita).
-- Transmite o áudio ao vivo para todos os participantes conectados na chamada via WebRTC (`aiortc`).
-
----
-
-## 📋 Pré-requisitos
-
-- Python **3.9 ou superior**
-- Uma conta/token de bot no Nerimity ([como criar um bot](https://docs.nerimity.com))
-- Acesso à internet (para os servidores STUN/TURN e para gerar o TTS)
-- (Opcional, mas recomendado) `ffmpeg` instalado no sistema
-
----
-
-## 🚀 Instalação — passo a passo
-
-### 1. Crie um ambiente virtual (recomendado)
+Instale os pacotes do sistema:
 
 ```bash
-python3 -m venv venv
-
+pkg update -y
+pkg install -y python tmux clang make libffi openssl libjpeg-turbo
 ```
 
-### 2. Instale as dependências
+> `clang`, `make`, `libffi` e `openssl` são necessários porque o `av` (PyAV)
+> e o `cryptography` podem precisar compilar no Termux.
+
+### Dependências Python
+
+Testado com **Python 3.14.10** e as versões de `requirements.txt`:
 
 ```bash
-~/venv/bin/pip install nerimity_sdk aiortc av numpy edge-tts
-
+pip install -r requirements.txt
 ```
 
-Se preferir instalar manualmente, sem o `requirements.txt`:
+Principais pacotes:
+
+| Pacote | Versão testada | Uso |
+|---|---|---|
+| `nerimity` | 1.6.2 | SDK do Nerimity (gateway + REST) |
+| `aiortc` | 1.16.0 | WebRTC (envio do áudio na call) |
+| `av` | 19.0.2 | Decodificar MP3 para PCM |
+| `numpy` | 2.5.5 | Processar os samples de áudio |
+| `gTTS` | 2.5.4 | Motor de voz rápido (padrão) |
+| `edge-tts` | 7.3.1 | Motor alternativo (voz AntonioNeural) |
+
+## Instalação
+
+1. Clone ou copie os arquivos para o Termux:
 
 ```bash
-pip install nerimity_sdk aiortc av numpy edge-tts
-
+mkdir -p ~/tts-bot ~/bots
+cp TTS.py start.sh stop.sh ~/tts-bot/
+cp watchdog.sh ~/bots/
+chmod +x ~/tts-bot/start.sh ~/tts-bot/stop.sh ~/bots/watchdog.sh
 ```
 
-> 💡 O `aiortc` e o `av` já trazem o `ffmpeg` embutido para decodificar áudio, então normalmente não é preciso instalar nada a mais no sistema. Se aparecer algum erro relacionado a `libav`/`ffmpeg` faltando, instale o ffmpeg do seu sistema:
-> ```bash
-> # Ubuntu/Debian
-> sudo apt install ffmpeg
-> 
-> # macOS (Homebrew)
-> brew install ffmpeg
-> 
-> ```
-> 
-> 
+2. Instale as dependências:
 
-### 3. Pegue o token do seu bot
+```bash
+cd ~/tts-bot
+pip install -r requirements.txt
+```
 
-1. Acesse as configurações de desenvolvedor da sua conta na Nerimity: `https://nerimity.com/app/settings/developer`
-2. Crie um bot e copie o **token**.
-3. Convide o bot para o seu servidor com permissão para ler mensagens e entrar em canais de voz.
+3. Configure o token do bot (veja abaixo).
 
-### 4. Pegue os IDs dos canais
+4. Inicie:
 
-No app da Nerimity, ative o **modo desenvolvedor** (se disponível) ou copie o ID pela URL do canal ao clicar nele. Você vai precisar de:
+```bash
+bash ~/tts-bot/start.sh
+```
 
-* ID do **canal de texto** que o bot vai "escutar".
-* ID do **canal de voz** que o bot vai entrar.
+## Configuração
 
-### 5. Configure o `bot.py`
+### Token do bot
 
-Abra o arquivo `bot.py` e edite o topo com suas informações:
+Em `TTS.py`, linha 28:
 
 ```python
 TOKEN = "SEU_TOKEN_AQUI"
-CANAL_TEXTO_ID = "ID_DO_CANAL_DE_TEXTO"
-CANAL_VOZ_ID = "ID_DO_CANAL_DE_VOZ"
-VOZ = "pt-BR-AntonioNeural"  # voz do TTS (veja a lista abaixo)
-
 ```
 
-### 6. Rode o bot
+Cole o token do seu bot Nerimity entre as aspas.
+
+> **Segurança:** se for publicar no GitHub, troque por variável de ambiente.
+> O repositório já traz um `.env.example` com `NERIMITY_TOKEN`. Nesse caso,
+> altere a linha para:
+>
+> ```python
+> TOKEN = os.getenv("NERIMITY_TOKEN", "")
+> ```
+>
+> e crie `~/tts-bot/.env` com `NERIMITY_TOKEN=seu_token` (o `.env` está no
+> `.gitignore` e não deve ser enviado ao GitHub).
+
+### Outras opções (topo do `TTS.py`)
+
+```python
+VOZ = "pt-BR-AntonioNeural"   # usada se TTS_ENGINE = "edge"
+TTS_ENGINE = "gtts"           # "gtts" (rápido) ou "edge" (voz más natural)
+GTTS_LANG = "pt-br"
+GTTS_TLD = "com.br"
+MAX_CACHE_TTS = 50            # quantidade de falas em cache
+MAX_QUEUE_FRAMES = 500        # buffer de áudio (10 s)
+USUARIOS_BLOQUEADOS = set()   # IDs que o bot ignora
+```
+
+## Como usar
+
+No canal de texto:
+
+| Comando | Ação |
+|---|---|
+| `-tts` | Entra na call (ou sai, se já estiver dentro) |
+| `-tts <id_do_canal_de_voz>` | Entra em um canal de voz específico |
+| `TESTE` (caixa alta) | O bot fala "SeuNome disse: TESTE" |
+| `OUTRA MENSAGEM` | O bot fala só a mensagem (sem repetir o nome) |
+
+Mensagens com letras minúsculas, links ou comandos são ignoradas.
+
+## Operação
 
 ```bash
-python bot.py
+# Iniciar / parar
+bash ~/tts-bot/start.sh
+bash ~/tts-bot/stop.sh
 
+# Ver logs ao vivo
+tail -f ~/tts-bot/bot.log
+
+# Ver a tela do bot
+tmux attach -t nerimity
+
+# Status de todos os bots (vídeo, TTS, música)
+bash ~/bots/watchdog.sh status
+
+# watchdog (reinicia bots que caíram a cada 30 min)
+bash ~/bots/watchdog.sh start
+bash ~/bots/watchdog.sh stop
 ```
 
-Se tudo der certo, você verá algo como:
+O `start.sh` usa `termux-wake-lock` para impedir que o Android suspenda o
+processo e mantém o bot sempre rodando dentro da sessão `nerimity` do tmux.
+
+## Estrutura
 
 ```
-🔄 Iniciando o Bot com o SDK oficial...
-✅ Conectado como SeuBot
-🔊 Entrou no canal de voz ...
+tts-bot/
+├── TTS.py        # código do bot
+├── start.sh      # inicia em tmux com auto-restart
+├── stop.sh       # para a sessão tmux
+└── bot.log       # logs (gerado automaticamente)
 
+bots/
+├── watchdog.sh   # monitora os bots
+└── watchdog.conf # lista de bots monitorados
 ```
 
-Agora é só mandar uma mensagem **EM CAPS LOCK** no canal de texto configurado — o bot vai gerar o áudio e falar na call.
+## Solução de problemas
 
----
+**O bot não fala nada**
+- Veja `tail -f ~/tts-bot/bot.log`. Procure por `👉 Falando na call`.
+- Se aparecer `⚠️ Erro ao gerar TTS`, rode `pip install -U gTTS edge-tts`.
 
-## 📦 O que tem no código
+**A voz sai cortada**
+- Confirme `MAX_QUEUE_FRAMES = 500` e que o `recv()` usa
+  `self._proximo += FRAME_MS / 1000` (relógio absoluto).
 
-O arquivo `bot.py` atualizado traz uma arquitetura robusta voltada para alta disponibilidade, segurança, gerenciamento dinâmico de múltiplas salas e otimização extrema de memória RAM:
+**O bot entra mas não dá som (precisa sair e voltar da call)**
+- Verifique se `GerenciadorSalas.usuarios_voz` e
+  `VoiceSession.conectar_usuarios()` estão presentes no código.
 
-1. **Configurações e Parâmetros da Chamada (`TOKEN`, `VOZ`, `ICE_SERVERS`)**:
-* Armazena o token do bot, a voz do Microsoft Edge TTS (`pt-BR-AntonioNeural`) e os servidores STUN/TURN oficiais extraídos do cliente web da Nerimity para negociação ICE de conexões WebRTC.
+**Erro `list.index(x): x not in list` ou `have-local-offer`**
+- Já tratado: offers remotos são ignorados quando há offer local pendente.
 
+**`Event loop is closed` ao reiniciar**
+- É residual de conexões antigas ao parar o bot; use sempre
+  `bash ~/tts-bot/stop.sh` antes de `start.sh` (nunca `pkill -f TTS.py`).
 
-2. **Sistema de Controle de Acesso e Bloqueio (`USUARIOS_BLOQUEADOS`)**:
-* Um conjunto (`set`) contendo IDs de usuários explicitamente impedidos de executar comandos (`!config`, `!sair`) nas mensagens diretas (DM) do bot.
+## Licença
 
-
-3. **Autenticação por Senha Mestre (`COMANDO_MESTRE`, `SENHA_MESTRE`)**:
-* Permite executar o comando `!master <senha>` via DM para desconectar o bot de todas as chamadas e resetar todas as salas ativas instantaneamente. Por ser autenticado via senha, funciona inclusive se enviado por usuários da lista de bloqueio.
-
-
-4. **Tratamento de Áudio com Prevenção de Inundação (`TTSAudioTrack`)**:
-* Subclasse de `MediaStreamTrack` do `aiortc`. Mantém um fluxo contínuo de pacotes em tempo real (20ms/frame) enviando silêncio até que o áudio PCM do TTS seja injetado.
-* Possui uma trava de segurança baseada na constante `MAX_QUEUE_FRAMES`: se uma conexão P2P travar e parar de consumir frames, os áudios antigos são descartados da fila em vez de acumularem na RAM.
-
-
-5. **Gerenciador de Conexão e Descarte Ativo de Áudio Recebido (`VoiceSession`)**:
-* Gerencia a presença e negociação SDP/ICE em um canal de voz.
-* **Consumo Ativo de Microfone**: Em redes WebRTC mesh, todos os participantes transmitem áudio para todos. Como o `aiortc` empilha áudios recebidos dos usuários numa fila sem limite (`RemoteStreamTrack._queue`), o bot roda a task `_descartar_audio_recebido` para ler e descartar continuamente todo o áudio dos outros participantes em segundo plano, impedindo vazamentos de memória por acúmulo de áudio.
-* **Watchdog de Conexão Zumbi**: A task `_watchdog_conexao` monitora conexões travadas nos estados `"connecting"` ou `"new"`. Se não estabelecerem comunicação em 20 segundos (`PEER_CONNECT_TIMEOUT`), a conexão é fechada e descartada automaticamente.
-
-
-6. **Decodificação Segura com Liberação de Recursos (`decodificar_mp3_para_pcm`)**:
-* Converte o arquivo MP3 gerado em PCM mono 16-bit 48kHz via PyAV/FFmpeg.
-* Utiliza bloco `try/finally` obrigatório para garantir o fechamento do container do FFmpeg (`container.close()`) mesmo que o arquivo venha corrompido ou incompleto (ex.: falha de pacote do `edge-tts` que gerava o erro `"packet queue is empty, aborting"`), impedindo o vazamento de descritores de arquivo.
-* A decodificação é executada em uma thread assíncrona separada (`asyncio.to_thread`) para evitar o bloqueio do loop de eventos principal do bot durante o processamento de CPU/IO.
-
-
-7. **Arquitetura Multi-Sala Assíncrona (`Sala`, `FluxoConfig`, `GerenciadorSalas`)**:
-* Permite que o bot esteja presente e ativo em múltiplas salas (duplas de canal de texto e voz) simultaneamente.
-* Gerencia estados de conversação interativa via DM (`ConfigState`) para criar novas salas passo a passo de forma isolada por usuário.
-
-
-
----
-
-## ⚙️ Como o bot funciona (Fluxo de Execução Técnica)
-
-Abaixo está o ciclo de vida operacional detalhado do bot, desde a recepção de comandos até o envio do fluxo de voz WebRTC:
-
-```
-                  [ Evento 'message:created' ]
-                               │
-               ┌───────────────┴───────────────┐
-               ▼                               ▼
-        [ Mensagem em DM ]            [ Mensagem no Servidor ]
-               │                               │
-       ┌───────┴───────┐              [ Pertence a uma Sala Ativa? ]
-       ▼               ▼                       │
- [ Comando !master ] [ Outros Comandos ]       ▼
- [ Valida Senha ]   [ Checa Bloqueio ]  [ Texto em CAPS LOCK? ]
-       │               │                       │
-       ▼               ▼                       ▼
- [ Reseta Salas ]   [!config / !sair]   [ Inicia Geração de TTS ]
-
-```
-
-### Detalhamento dos Processos:
-
-1. **Configuração Dinâmica de Salas via DM**:
-* O usuário envia `!config` na DM do bot.
-* O `GerenciadorSalas` inicia um `FluxoConfig` no estado `AGUARDANDO_TEXTO` e solicita o ID do canal de texto.
-* Após o recebimento e validação, o estado passa para `AGUARDANDO_VOZ` e solicita o ID do canal de voz.
-* O bot aciona `bot.rest.join_voice()` para registrar presença no canal e cria a `VoiceSession`.
-
-
-2. **Negociação WebRTC Mesh**:
-* Quando um participante entra no canal de voz, o evento `voice:user_joined` dispara `ao_usuario_entrar`.
-* O bot cria uma oferta SDP via `RTCPeerConnection` (`aiortc`), envia via socket `voice:signal_send` e aguarda a resposta SDP e candidatos ICE via `voice:signal_received`.
-* Assim que estabelecida a conexão, o bot associa um `TTSAudioTrack` para transmissão e inicia o loop assíncrono para descartar o áudio que o usuário transmite na call.
-
-
-3. **Ciclo de Processamento da Fala (TTS)**:
-* Uma mensagem em CAIXA ALTA (`isupper()`) postada no canal de texto cadastrado aciona a função `falar()`.
-* O bot gera o áudio MP3 utilizando `edge_tts.Communicate`.
-* O arquivo é validado (verificando se o tamanho é maior que 0 bytes para prevenir erros de rede/rate limit).
-* O áudio é decodificado via `decodificar_mp3_para_pcm` em thread separada, convertendo para PCM bruto de 48kHz.
-* O PCM é fatiado em blocos equivalentes a 20ms de áudio (`SAMPLES_PER_FRAME = 960` amostras) e inserido via `push_pcm()` na fila de cada participante ativo na chamada.
-* O arquivo MP3 temporário é excluído do disco no bloco `finally`.
-
-
-4. **Gerenciamento de Comandos Disponíveis via DM**:
-* `!config`: Inicia o assistente de criação de uma nova sala (canal de texto + canal de voz).
-* `!sair <id_canal_voz>`: Remove o bot de uma chamada de voz específica e encerra a sala correspondente.
-* `!master <senha>`: Comando mestre global que força a desconexão de todas as chamadas e o encerramento de todas as salas cadastradas.
-
-
-
----
-
-## 🎙️ Trocando a voz do TTS
-
-O `edge-tts` suporta várias vozes em português e outros idiomas. Para listar todas as vozes disponíveis:
-
-```bash
-edge-tts --list-voices | grep pt-BR
-
-```
-
-Exemplos de vozes em português do Brasil:
-
-| Voz | Gênero |
-| --- | --- |
-| `pt-BR-AntonioNeural` | Masculina |
-| `pt-BR-FranciscaNeural` | Feminina |
-
-Basta trocar o valor de `VOZ` no topo do `bot.py`.
-
----
-
-## 🗂️ Estrutura do projeto
-
-```
-.
-├── bot.py             # código principal do bot
-├── requirements.txt   # dependências Python
-└── README.md          # esta documentação
-
-```
-
----
-
-## 🔧 Como funciona (visão geral técnica)
-
-1. O bot conecta ao gateway (WebSocket) da Nerimity usando o `nerimity_sdk`.
-2. Assim que fica pronto (`evento ready`), chama o endpoint REST `POST /channels/{id}/voice/join` para entrar no canal de voz.
-3. Para cada participante já presente ou que entra depois, o bot negocia uma conexão **WebRTC ponto a ponto** (oferta/resposta SDP + candidatos ICE), trocando essas mensagens pelos eventos de socket `voice:signal_send` / `voice:signal_received` — exatamente como o cliente web oficial faz internamente com a biblioteca `simple-peer`.
-4. Quando uma mensagem em CAIXA ALTA chega no canal de texto configurado, o bot gera o áudio com `edge-tts`, decodifica para PCM com `av` (PyAV) e envia esse áudio por dentro de cada conexão WebRTC ativa, usando `aiortc`.
-
----
-
-## ❓ Solução de problemas
-
-**`ModuleNotFoundError: No module named 'av'` (ou `aiortc`, `edge_tts`, `nerimity_sdk`)**
-→ As dependências não foram instaladas no ambiente Python que você está usando para rodar o bot. Rode `pip install -r requirements.txt` dentro do mesmo venv/interpretador usado para executar o `bot.py`.
-
-**O bot entra na call mas ninguém ouve nada**
-→ Verifique no console as linhas `[RTC] <usuario>: <estado>`. Se o estado nunca chega a `connected`, pode ser um problema de conectividade ICE/TURN (rede com firewall restritivo, por exemplo).
-
-**O bot lê a própria mensagem e entra em loop**
-→ Confirme que o token configurado é o do bot correto e que o evento `ready` está disparando (deve aparecer `✅ Conectado como ...` no console).
-
-**Erro relacionado a `ffmpeg`/`libav**`
-→ Instale o ffmpeg no sistema operacional (veja o passo 3 acima).
-
----
+Uso pessoal. Ajuste o token e as configurações antes de publicar.
