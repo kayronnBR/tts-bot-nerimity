@@ -4,6 +4,7 @@ aviso de CAPSLOCK com autodeleção em 1 minuto e leitura estrita em maiúsculas
 """
 
 import asyncio
+from collections import OrderedDict
 import fractions
 import os
 import time
@@ -24,8 +25,14 @@ from aiortc.sdp import candidate_from_sdp
 from nerimity_sdk import Bot
 
 # --- CONFIGURAÇÕES ---
-TOKEN = "TOKEN"
+TOKEN = "MTc4MDY5MDI4NzY2OTE5ODg0OC0x.Ibu02sVT2_JGu-NIWTJgk9DwhdkdFnY8qZ0Xs8dZbaI"
 VOZ = "pt-BR-AntonioNeural"
+
+# "gtts" = mais rapido (~0,5s) | "edge" = voz AntonioNeural (~1,5s)
+TTS_ENGINE = "gtts"
+GTTS_LANG = "pt-br"
+GTTS_TLD = "com.br"
+MAX_CACHE_TTS = 50
 
 USUARIOS_BLOQUEADOS: Set[str] = {
     # "ID_USUARIO_BLOQUEADO",
@@ -35,7 +42,7 @@ SAMPLE_RATE = 48000
 FRAME_MS = 20
 SAMPLES_PER_FRAME = SAMPLE_RATE * FRAME_MS // 1000  # 960 amostras por quadro
 
-MAX_QUEUE_FRAMES = 100
+MAX_QUEUE_FRAMES = 500  # 10s de buffer: nao corta o inicio da frase com o nome
 PEER_CONNECT_TIMEOUT = 20
 
 ICE_SERVERS = [
@@ -55,6 +62,20 @@ ICE_SERVERS = [
 
 bot = Bot(token=TOKEN)
 
+# Compatibilidade: algumas versoes do nerimity_sdk nao inicializam estes atributos
+for _attr, _default in (
+    ("_health_port", None),
+    ("_health_server", None),
+    ("_watch", False),
+    ("_watch_paths", None),
+    ("_watcher", None),
+):
+    if not hasattr(bot, _attr):
+        setattr(bot, _attr, _default)
+
+
+_CACHE_PCM: "OrderedDict[str, bytes]" = OrderedDict()
+
 
 class TTSAudioTrack(MediaStreamTrack):
     kind = "audio"
@@ -63,7 +84,7 @@ class TTSAudioTrack(MediaStreamTrack):
         super().__init__()
         self._queue: "asyncio.Queue[bytes]" = asyncio.Queue()
         self._pts = 0
-        self._start: Optional[float] = None
+        self._proximo: Optional[float] = None
 
     async def push_pcm(self, pcm_bytes: bytes) -> None:
         frame_bytes = SAMPLES_PER_FRAME * 2
@@ -80,13 +101,15 @@ class TTSAudioTrack(MediaStreamTrack):
             await self._queue.put(chunk)
 
     async def recv(self):
-        if self._start is None:
-            self._start = time.monotonic()
-
-        target = self._start + (self._pts / SAMPLE_RATE)
-        delay = target - time.monotonic()
-        if delay > 0:
-            await asyncio.sleep(delay)
+        # Relogio absoluto: cada frame sai exatamente em um multiplo de 20ms.
+        # O asyncio.sleep no Termux dorme ~23ms; dormir "20ms" a cada frame
+        # acumula atraso e o receptor descarta os packets como "late".
+        if self._proximo is None:
+            self._proximo = time.monotonic()
+        atraso = self._proximo - time.monotonic()
+        if atraso > 0:
+            await asyncio.sleep(atraso)
+        self._proximo += FRAME_MS / 1000
 
         try:
             chunk = self._queue.get_nowait()
@@ -95,7 +118,6 @@ class TTSAudioTrack(MediaStreamTrack):
 
         # Garante conversão e normalização exata para evitar estouro/chiado no WebRTC
         samples = np.frombuffer(chunk, dtype=np.int16).copy()
-        # Limita o volume para evitar pico de áudio estourado
         samples = np.clip(samples, -32768, 32767).reshape(1, -1)
 
         frame = av.AudioFrame.from_ndarray(samples, format="s16", layout="mono")
@@ -112,10 +134,10 @@ def decodificar_mp3_para_pcm(caminho: str) -> bytes:
     try:
         stream = container.streams.audio[0]
         resampler = av.AudioResampler(
-            format="s16", 
-            layout="mono", 
+            format="s16",
+            layout="mono",
             rate=SAMPLE_RATE,
-            frame_size=SAMPLES_PER_FRAME
+            frame_size=SAMPLES_PER_FRAME,
         )
         pcm = bytearray()
         for frame in container.decode(stream):
@@ -135,6 +157,22 @@ class VoiceSession:
         self.tracks: Dict[str, TTSAudioTrack] = {}
         self._drain_tasks: Dict[str, list] = {}
         self._connected = False
+
+    async def conectar_usuarios(self, user_ids) -> None:
+        """Cria a conexao WebRTC com usuarios que ja estavam na call."""
+        for user_id in user_ids:
+            uid = str(user_id)
+            if uid == self.my_user_id or uid in self.peers:
+                continue
+            try:
+                pc = self._nova_conexao(uid)
+                offer = await pc.createOffer()
+                await pc.setLocalDescription(offer)
+                await self._enviar_sinal(
+                    uid, {"type": pc.localDescription.type, "sdp": pc.localDescription.sdp}
+                )
+            except Exception as exc:
+                print(f"⚠️ Falha ao conectar {uid}: {exc}", flush=True)
 
     async def join(self) -> None:
         gateway = self.bot._gateway
@@ -248,6 +286,10 @@ class VoiceSession:
         if "sdp" in signal:
             if pc is None:
                 pc = self._nova_conexao(from_user_id)
+            # Glare: as vezes o usuario envia offer enquanto o nosso esta
+            # pendente. Ignoramos o dele para nao quebrar a negociacao.
+            if signal["type"] == "offer" and pc.signalingState == "have-local-offer":
+                return
             desc = RTCSessionDescription(sdp=signal["sdp"], type=signal["type"])
             await pc.setRemoteDescription(desc)
             if signal["type"] == "offer":
@@ -273,26 +315,53 @@ class VoiceSession:
             await pc.addIceCandidate(candidate)
 
     async def falar(self, texto: str, voz: str = VOZ) -> None:
-        out_file = f"tts_temp_{int(time.time() * 1000)}.mp3"
-        try:
-            communicate = edge_tts.Communicate(texto, voz)
-            await communicate.save(out_file)
+        inicio = time.monotonic()
+        chave_cache = f"{TTS_ENGINE}|{voz}|{texto}"
 
-            if not os.path.exists(out_file) or os.path.getsize(out_file) == 0:
-                return
-
+        pcm = _CACHE_PCM.get(chave_cache)
+        if pcm is not None:
+            _CACHE_PCM.move_to_end(chave_cache)
+            print(f"⚡ TTS do cache ({time.monotonic() - inicio:.2f}s)")
+        else:
+            out_file = f"tts_temp_{int(time.time() * 1000)}.mp3"
             try:
+                if TTS_ENGINE == "gtts":
+                    def gerar_gtts():
+                        from gtts import gTTS
+                        gTTS(text=texto, lang=GTTS_LANG, tld=GTTS_TLD).save(out_file)
+
+                    try:
+                        await asyncio.to_thread(gerar_gtts)
+                    except Exception as exc:
+                        print(f"⚠️ gTTS falhou ({exc}); usando edge-tts")
+                        communicate = edge_tts.Communicate(texto, voz)
+                        await communicate.save(out_file)
+                else:
+                    communicate = edge_tts.Communicate(texto, voz)
+                    await communicate.save(out_file)
+
+                if not os.path.exists(out_file) or os.path.getsize(out_file) == 0:
+                    print("⚠️ TTS gerou arquivo vazio")
+                    return
+
                 pcm = await asyncio.to_thread(decodificar_mp3_para_pcm, out_file)
+                _CACHE_PCM[chave_cache] = pcm
+                if len(_CACHE_PCM) > MAX_CACHE_TTS:
+                    _CACHE_PCM.popitem(last=False)
+                print(f"⏱️ TTS pronto em {time.monotonic() - inicio:.2f}s ({TTS_ENGINE})")
             except Exception as exc:
-                print(f"⚠️ Erro ao decodificar TTS: {exc}")
+                print(f"⚠️ Erro ao gerar TTS: {exc}")
                 return
-        finally:
-            if os.path.exists(out_file):
-                os.remove(out_file)
+            finally:
+                if os.path.exists(out_file):
+                    os.remove(out_file)
 
         if self.tracks:
+            # 500ms de silencio para o jitter buffer estabilizar e nao cortar
+            # o inicio da frase (onde esta o nome do usuario)
+            lead_in = b"\x00" * (SAMPLE_RATE // 2 * 2)
+            pcm = lead_in + pcm
             await asyncio.gather(*(track.push_pcm(pcm) for track in self.tracks.values()))
-
 
 class GerenciadorSalas:
     def __init__(self, bot_inst: Bot):
@@ -300,9 +369,14 @@ class GerenciadorSalas:
         self.my_user_id: Optional[str] = None
         self.salas_por_texto: Dict[str, str] = {}
         self.sessions: Dict[str, VoiceSession] = {}
+        # Usuarios presentes em cada canal de voz (mesmo antes do bot entrar)
+        self.usuarios_voz: Dict[str, set] = {}
 
 
 gerenciador = GerenciadorSalas(bot)
+
+# So anuncia o nome do usuario quando a pessoa muda
+ULTIMO_USUARIO_TTS: Optional[str] = None
 
 
 @bot.on("ready")
@@ -313,14 +387,22 @@ async def on_ready(me):
 
 @bot.on("voice:user_joined")
 async def on_voice_user_joined(payload):
-    sala = gerenciador.sessions.get(str(payload.get("channelId", "")))
+    canal = str(payload.get("channelId", ""))
+    uid = payload.get("userId")
+    if canal and uid:
+        gerenciador.usuarios_voz.setdefault(canal, set()).add(str(uid))
+    sala = gerenciador.sessions.get(canal)
     if sala:
         await sala.ao_usuario_entrar(payload)
 
 
 @bot.on("voice:user_left")
 async def on_voice_user_left(payload):
-    sala = gerenciador.sessions.get(str(payload.get("channelId", "")))
+    canal = str(payload.get("channelId", ""))
+    uid = payload.get("userId")
+    if canal in gerenciador.usuarios_voz and uid:
+        gerenciador.usuarios_voz[canal].discard(str(uid))
+    sala = gerenciador.sessions.get(canal)
     if sala:
         await sala.ao_usuario_sair(payload)
 
@@ -334,6 +416,7 @@ async def on_voice_signal(payload):
 
 @bot.on("message:created")
 async def on_message(event):
+    global ULTIMO_USUARIO_TTS
     msg = event.message
     channel_id = str(msg.channel_id)
     conteudo = getattr(msg, "content", "") or ""
@@ -375,7 +458,12 @@ async def on_message(event):
 
         gerenciador.salas_por_texto[channel_id] = canal_voz_alvo
         gerenciador.sessions[canal_voz_alvo] = voice_session
-        
+
+        # Conecta com quem ja estava na call antes do bot entrar
+        await voice_session.conectar_usuarios(
+            gerenciador.usuarios_voz.get(canal_voz_alvo, set())
+        )
+
         # Mensagem atualizada informando que o bot só lê CAPSLOCK + aviso de sincronização
         mensagem_aviso = await bot.rest.create_message(
             channel_id, 
@@ -405,7 +493,15 @@ async def on_message(event):
 
         session = gerenciador.sessions.get(canal_voz_id)
         if session:
-            texto_para_falar = f"{autor_nome} disse: {conteudo_stripped}"
+            chave_usuario = str(autor_id) if autor_id else autor_nome
+            # So anuncia o nome do usuario quando a pessoa muda
+            if ULTIMO_USUARIO_TTS is not None and chave_usuario == ULTIMO_USUARIO_TTS:
+                prefixo = ""
+            else:
+                prefixo = f"{autor_nome} disse: "
+                ULTIMO_USUARIO_TTS = chave_usuario
+
+            texto_para_falar = f"{prefixo}{conteudo_stripped}"
             print(f"👉 Falando na call: {texto_para_falar}")
             await session.falar(texto_para_falar)
 
